@@ -1,10 +1,10 @@
 """
 Data Loader Module for CTR Prediction Dataset.
-Provides high-performance, memory-efficient loading of raw CSV files using Polars.
+Provides high-performance, memory-efficient loading and lazy scanning of raw CSV files using Polars.
 """
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 import logging
 import polars as pl
 
@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 class CTRDataLoader:
     """
-    Handles reading raw dataset CSV files (user_profile, ad_feature, raw_sample)
-    with memory optimization, whitespace stripping, and optional sampling.
+    Handles reading and scanning raw dataset CSV files (user_profile, ad_feature, raw_sample)
+    using Polars LazyFrame (scan_csv) and streaming execution for optimal memory efficiency.
     """
 
     def __init__(
@@ -46,70 +46,120 @@ class CTRDataLoader:
         self.random_seed = random_seed
 
     @staticmethod
-    def _strip_column_names(df: pl.DataFrame) -> pl.DataFrame:
-        """Strip trailing/leading whitespace from DataFrame column names."""
-        return df.rename({col: col.strip() for col in df.columns})
+    def _get_column_strip_map(columns: List[str]) -> Dict[str, str]:
+        """Generate rename mapping to strip trailing/leading whitespace from headers."""
+        return {col: col.strip() for col in columns if col != col.strip()}
+
+    def scan_user_profile(self) -> pl.LazyFrame:
+        """
+        Lazily scan user_profile.csv using Polars scan_csv.
+
+        Returns:
+            pl.LazyFrame: LazyFrame of user profile records.
+        """
+        if not self.user_profile_path.exists():
+            raise FileNotFoundError(f"User profile file not found at: {self.user_profile_path}")
+
+        lf = pl.scan_csv(self.user_profile_path)
+        # Strip whitespace from column names in schema
+        cols = lf.collect_schema().names()
+        rename_map = self._get_column_strip_map(cols)
+        if rename_map:
+            lf = lf.rename(rename_map)
+        return lf
+
+    def scan_ad_feature(self) -> pl.LazyFrame:
+        """
+        Lazily scan ad_feature.csv using Polars scan_csv.
+
+        Returns:
+            pl.LazyFrame: LazyFrame of ad metadata records.
+        """
+        if not self.ad_feature_path.exists():
+            raise FileNotFoundError(f"Ad feature file not found at: {self.ad_feature_path}")
+
+        lf = pl.scan_csv(self.ad_feature_path)
+        cols = lf.collect_schema().names()
+        rename_map = self._get_column_strip_map(cols)
+        if rename_map:
+            lf = lf.rename(rename_map)
+        return lf
+
+    def scan_raw_sample(self) -> pl.LazyFrame:
+        """
+        Lazily scan raw_sample.csv with lazy sampling and streaming optimization.
+
+        Returns:
+            pl.LazyFrame: LazyFrame of interaction logs.
+        """
+        if not self.raw_sample_path.exists():
+            raise FileNotFoundError(f"Raw sample file not found at: {self.raw_sample_path}")
+
+        # If a fixed sample_size is requested, use n_rows in scan_csv to read only required rows
+        if self.sample_size is not None and self.sample_size > 0:
+            logger.info(f"Lazily scanning raw_sample with limit n_rows={self.sample_size:,}...")
+            lf = pl.scan_csv(self.raw_sample_path, n_rows=self.sample_size)
+        else:
+            lf = pl.scan_csv(self.raw_sample_path)
+
+        cols = lf.collect_schema().names()
+        rename_map = self._get_column_strip_map(cols)
+        if rename_map:
+            lf = lf.rename(rename_map)
+
+        return lf
 
     def load_user_profile(self) -> pl.DataFrame:
         """
-        Load user_profile.csv with stripped column headers and optimized types.
+        Load user_profile.csv into memory using lazy scan and collect.
 
         Returns:
             pl.DataFrame: Cleaned user profile records.
         """
         logger.info(f"Loading user profiles from: {self.user_profile_path}")
-        if not self.user_profile_path.exists():
-            raise FileNotFoundError(f"User profile file not found at: {self.user_profile_path}")
-
-        df = pl.read_csv(self.user_profile_path)
-        df = self._strip_column_names(df)
+        df = self.scan_user_profile().collect()
         logger.info(f"Loaded user_profile: {df.shape[0]:,} rows, {df.shape[1]} columns")
         return df
 
     def load_ad_feature(self) -> pl.DataFrame:
         """
-        Load ad_feature.csv with stripped column headers and optimized types.
+        Load ad_feature.csv into memory using lazy scan and collect.
 
         Returns:
             pl.DataFrame: Cleaned ad feature records.
         """
         logger.info(f"Loading ad features from: {self.ad_feature_path}")
-        if not self.ad_feature_path.exists():
-            raise FileNotFoundError(f"Ad feature file not found at: {self.ad_feature_path}")
-
-        df = pl.read_csv(self.ad_feature_path)
-        df = self._strip_column_names(df)
+        df = self.scan_ad_feature().collect()
         logger.info(f"Loaded ad_feature: {df.shape[0]:,} rows, {df.shape[1]} columns")
         return df
 
     def load_raw_sample(self) -> pl.DataFrame:
         """
-        Load raw_sample.csv with stripped column headers and optional sampling.
+        Load raw_sample.csv efficiently using scan_csv with lazy sampling / head limits.
 
         Returns:
             pl.DataFrame: Impression interaction log records.
         """
         logger.info(f"Loading interaction logs from: {self.raw_sample_path}")
-        if not self.raw_sample_path.exists():
-            raise FileNotFoundError(f"Raw sample file not found at: {self.raw_sample_path}")
+        lf = self.scan_raw_sample()
 
-        # If sample_size is requested, we can use Polars n_rows or sample after load
-        df = pl.read_csv(self.raw_sample_path)
-        df = self._strip_column_names(df)
-
-        if self.sample_size is not None and self.sample_size < len(df):
-            logger.info(f"Sampling {self.sample_size:,} rows (random_seed={self.random_seed})...")
-            df = df.sample(n=self.sample_size, seed=self.random_seed)
+        if self.sample_size is not None and self.sample_size > 0:
+            logger.info(f"Collecting sample of {self.sample_size:,} rows...")
+            df = lf.head(self.sample_size).collect()
         elif self.sample_fraction is not None and 0.0 < self.sample_fraction < 1.0:
-            logger.info(f"Sampling {self.sample_fraction:.2%} of dataset (random_seed={self.random_seed})...")
-            df = df.sample(fraction=self.sample_fraction, seed=self.random_seed)
+            logger.info(f"Streaming and sampling {self.sample_fraction:.2%} of dataset (seed={self.random_seed})...")
+            # Collect streaming and apply fraction sample
+            df = lf.collect(streaming=True).sample(fraction=self.sample_fraction, seed=self.random_seed)
+        else:
+            logger.info("Collecting full raw_sample dataset using streaming engine...")
+            df = lf.collect(streaming=True)
 
         logger.info(f"Loaded raw_sample: {df.shape[0]:,} rows, {df.shape[1]} columns")
         return df
 
     def load_all(self) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
         """
-        Load all three datasets.
+        Load all three datasets into memory.
 
         Returns:
             Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
