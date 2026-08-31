@@ -1,0 +1,67 @@
+# ==============================================================================
+# CTR Prediction - Preprocessing Configuration
+# ==============================================================================
+
+# Data Paths
+paths:
+  raw_user_profile: "data/raw/user_profile.csv"
+  raw_ad_feature: "data/raw/ad_feature.csv"
+  raw_sample: "data/raw/raw_sample.csv"
+  processed_dir: "data/processed"
+  train_output: "data/processed/train.parquet"
+  val_output: "data/processed/val.parquet"
+  test_output: "data/processed/test.parquet"
+  metadata_output: "data/processed/preprocessing_meta.joblib"
+
+# Data Types Configuration for Memory Optimization
+dtypes:
+  raw_sample:
+    user: "UInt32"
+    time_stamp: "Int64"
+    adgroup_id: "UInt32"
+    pid: "Categorical"
+    nonclk: "UInt8"
+    clk: "UInt8"
+  
+  user_profile:
+    userid: "UInt32"
+    cms_segid: "Int32"
+    cms_group_id: "Int32"
+    final_gender_code: "Int8"
+    age_level: "Int8"
+    pvalue_level: "Int8"
+    shopping_level: "Int8"
+    occupation: "Int8"
+    new_user_class_level: "Int8"
+    
+  ad_feature:
+    adgroup_id: "UInt32"
+    cate_id: "UInt32"
+    campaign_id: "UInt32"
+    customer: "UInt32"
+    brand: "Int32"
+    price: "Float32"
+
+# Missing Value Imputation Strategy
+imputation:
+  user_missing_val: -1
+  brand_unknown_val: -1
+  price_fallback: "median"  # 'median', 'zero', or float value
+
+# Time-Based Dataset Split Configuration
+split:
+  strategy: "time"              # Options: 'time', 'date'
+  # Alibaba dataset time range: 2017-05-06 23:00:00 to 2017-05-13 22:59:46
+  # Train: 2017-05-06 to 2017-05-11
+  # Val:   2017-05-12
+  # Test:  2017-05-13
+  train_end_date: "2017-05-11"
+  val_date: "2017-05-12"
+  test_date: "2017-05-13"
+
+# Sampling Configuration for Fast Development / Prototyping
+sampling:
+  enabled: false
+  sample_fraction: 0.05        # 5% of dataset for quick iterations
+  sample_size: null            # e.g., 500000 rows
+  random_seed: 42
