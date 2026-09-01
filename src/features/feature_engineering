@@ -1,0 +1,19 @@
+"""
+Feature Engineering Module for CTR Prediction.
+
+Implements exposure-sequence counters, price transformations, cyclical time
+encodings, cross features, and out-of-fold smoothed Bayesian target encoding.
+"""
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+import logging
+import math
+
+import numpy as np
+import polars as pl
+import yaml
+
+logger = logging.getLogger(__name__)
+
+_SPLIT_COL = "_split"
