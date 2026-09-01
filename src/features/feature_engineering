@@ -17,3 +17,101 @@ import yaml
 logger = logging.getLogger(__name__)
 
 _SPLIT_COL = "_split"
+
+class CTRFeatureEngineer:
+    """Generates model-ready features for the Alibaba CTR dataset."""
+
+    def __init__(
+        self,
+        config: Optional[Union[str, Path, Dict[str, Any]]] = None,
+        target_encode_cols: Optional[List[str]] = None,
+        smoothing: float = 20.0,
+        n_folds: int = 5,
+        random_seed: int = 42,
+    ):
+        cfg = self._load_config(config)
+        te_cfg = cfg.get("feature_engineering", {}).get("target_encoding", {})
+
+        self.target_encode_cols = (
+            target_encode_cols
+            or te_cfg.get("columns")
+            or ["cate_id", "brand", "customer", "pid"]
+        )
+        self.smoothing = te_cfg.get("smoothing", smoothing)
+        self.n_folds = te_cfg.get("n_folds", n_folds)
+        self.random_seed = te_cfg.get("random_seed", random_seed)
+
+        self.cate_median_price: Optional[pl.DataFrame] = None
+        self.global_median_price: Optional[float] = None
+        self.global_ctr: Optional[float] = None
+        self.target_encoding_maps: Dict[str, pl.DataFrame] = {}
+
+    @staticmethod
+    def _load_config(config: Optional[Union[str, Path, Dict[str, Any]]]) -> Dict[str, Any]:
+        """Load YAML config or return dictionary."""
+        if config is None:
+            return {}
+        if isinstance(config, dict):
+            return config
+        config_path = Path(config)
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        logger.warning(f"Config file not found at {config_path}, using defaults.")
+        return {}
+
+    # ------------------------------------------------------------------ #
+    # Exposure Sequence (Ad Fatigue)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def add_exposure_sequence(df: pl.DataFrame) -> pl.DataFrame:
+        """Add prior-exposure counts per (user, adgroup_id) and (user, cate_id)."""
+        logger.info("Computing exposure sequence counters (ad fatigue)...")
+        df = df.sort("time_stamp")
+        df = df.with_columns([
+            (pl.col("time_stamp").cum_count().over(["user", "adgroup_id"]) - 1)
+            .cast(pl.Int32)
+            .alias("user_adgroup_exposure_seq"),
+            (pl.col("time_stamp").cum_count().over(["user", "cate_id"]) - 1)
+            .cast(pl.Int32)
+            .alias("user_cate_exposure_seq"),
+        ])
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Price Transformations
+    # ------------------------------------------------------------------ #
+    def fit_price_stats(self, train_df: pl.DataFrame) -> "CTRFeatureEngineer":
+        """Fit per-category median price on the training partition."""
+        logger.info("Fitting per-category median price statistics on train partition...")
+        self.cate_median_price = (
+            train_df.group_by("cate_id")
+            .agg(pl.col("price").median().alias("cate_median_price"))
+        )
+        self.global_median_price = float(train_df.select(pl.col("price").median()).item() or 0.0)
+        return self
+
+    def add_price_features(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Add `price_log` (log1p) and `price_ratio_cate` (price / train-fitted category median)."""
+        if self.cate_median_price is None:
+            raise RuntimeError("fit_price_stats() must be called before add_price_features().")
+
+        logger.info("Adding price_log and price_ratio_cate features...")
+        fallback = self.global_median_price or 1.0
+
+        df = df.join(self.cate_median_price, on="cate_id", how="left")
+        df = df.with_columns([
+            pl.col("price").log1p().cast(pl.Float32).alias("price_log"),
+            pl.col("cate_median_price").fill_null(fallback).alias("cate_median_price"),
+        ])
+        df = df.with_columns([
+            (
+                pl.col("price")
+                / pl.when(pl.col("cate_median_price") > 0)
+                .then(pl.col("cate_median_price"))
+                .otherwise(fallback)
+            )
+            .cast(pl.Float32)
+            .alias("price_ratio_cate")
+        ]).drop("cate_median_price")
+        return df
