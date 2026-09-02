@@ -45,6 +45,10 @@ CTR_Prediction/
 │   │   ├── cleaner.py                  # Missing value imputation and relational table joins
 │   │   ├── preprocessor.py             # End-to-end preprocessing pipeline orchestrator
 │   │   └── run_preprocessing.py        # CLI entry point for data processing
+│   ├── features/                       # Feature engineering: exposure, price, cyclical time, cross, target encoding
+│   │   ├── __init__.py
+│   │   ├── feature_engineer.py         # CTRFeatureEngineer pipeline orchestrator
+│   │   └── run_feature_engineering.py  # CLI entry point for feature engineering
 │   ├── model/                          # Machine Learning model definitions and wrappers (Upcoming)
 │   └── evaluate/                       # Model evaluation, metric calculation, and SHAP diagnostics (Upcoming)
 │
@@ -82,21 +86,25 @@ CTR_Prediction/
    - Mutual Information (MI) and Information Value (IV) ranking against the `clk` target.
    - Formulation of the definitive Feature Decision Matrix.
 
+4. Feature Engineering Pipeline (`src/features/`):
+   - Exposure sequence counters (`user_adgroup_exposure_seq`, `user_cate_exposure_seq`) modeling ad fatigue, computed over the full chronological history.
+   - Price transformations: `price_log` (`log1p(price)`) and `price_ratio_cate` (price relative to train-fitted per-`cate_id` median).
+   - Cyclical time encodings: sine/cosine pairs for `hour` and `day_of_week`.
+   - Cross features: `gender_x_cate` (`final_gender_code` x `cate_id`) and `pid_x_cate` (`pid` x `cate_id`).
+   - Out-of-fold smoothed Bayesian target encoding for high-cardinality IDs (`cate_id`, `brand`, `customer`, `pid`), fitted exclusively on train and frozen onto val/test to prevent leakage.
+
 ### Upcoming Phases
-4. Feature Engineering and Feature Selection:
-   - Implementation of exposure sequence counters (ad fatigue modeling).
-   - Price transformations (`log1p(price)` and category-relative price ratios).
-   - Out-of-fold Bayesian smoothed target encodings for high-cardinality IDs (`cate_id`, `brand`, `customer`, `pid`).
+5. Feature Selection:
    - Automated feature selection module based on Mutual Information and LightGBM Gain.
 
-5. Multi-Model Machine Learning Experiments:
+6. Multi-Model Machine Learning Experiments:
    - Development of standardized wrappers for 4 tree-based algorithms:
      - LightGBM: Fast histogram-based gradient boosting with native categorical handling.
      - CatBoost: Ordered boosting with robust handling of categorical combinations.
      - XGBoost: Exact and histogram-based gradient boosted trees.
      - RandomForest: Bagging benchmark on stratified subsets.
 
-6. Hyperparameter Tuning, Explainability, and Ensembling:
+7. Hyperparameter Tuning, Explainability, and Ensembling:
    - Automated hyperparameter optimization using Optuna.
    - Global and local feature interpretability using SHAP.
    - Ensembling / Stacking of top-performing models for final test submission.
@@ -132,6 +140,13 @@ python -m src.preprocessing.run_preprocessing --full
 Launch Jupyter Notebook to inspect correlation heatmaps and diagnostic reports:
 ```bash
 jupyter notebook notebook/feature_analysis.ipynb
+```
+
+### 4. Running Feature Engineering
+Reads `train.parquet` / `val.parquet` / `test.parquet` from `data/processed/` and writes engineered `train_fe.parquet`, `val_fe.parquet`, `test_fe.parquet`:
+
+```bash
+python -m src.features.run_feature_engineering --config configs/feature_engineering.yaml
 ```
 
 ## 5. Team Contribution Guidelines

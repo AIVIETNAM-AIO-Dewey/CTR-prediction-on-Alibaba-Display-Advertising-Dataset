@@ -50,6 +50,18 @@ class CTRDataLoader:
         """Generate rename mapping to strip trailing/leading whitespace from headers."""
         return {col: col.strip() for col in columns if col != col.strip()}
 
+    @classmethod
+    def _scan_csv_stripped(cls, path: Path, **scan_csv_kwargs) -> pl.LazyFrame:
+        """Lazily scan a CSV file and strip whitespace from its column headers."""
+        if not path.exists():
+            raise FileNotFoundError(f"File not found at: {path}")
+
+        lf = pl.scan_csv(path, **scan_csv_kwargs)
+        rename_map = cls._get_column_strip_map(lf.collect_schema().names())
+        if rename_map:
+            lf = lf.rename(rename_map)
+        return lf
+
     def scan_user_profile(self) -> pl.LazyFrame:
         """
         Lazily scan user_profile.csv using Polars scan_csv.
@@ -57,16 +69,7 @@ class CTRDataLoader:
         Returns:
             pl.LazyFrame: LazyFrame of user profile records.
         """
-        if not self.user_profile_path.exists():
-            raise FileNotFoundError(f"User profile file not found at: {self.user_profile_path}")
-
-        lf = pl.scan_csv(self.user_profile_path)
-        # Strip whitespace from column names in schema
-        cols = lf.collect_schema().names()
-        rename_map = self._get_column_strip_map(cols)
-        if rename_map:
-            lf = lf.rename(rename_map)
-        return lf
+        return self._scan_csv_stripped(self.user_profile_path)
 
     def scan_ad_feature(self) -> pl.LazyFrame:
         """
@@ -75,15 +78,7 @@ class CTRDataLoader:
         Returns:
             pl.LazyFrame: LazyFrame of ad metadata records.
         """
-        if not self.ad_feature_path.exists():
-            raise FileNotFoundError(f"Ad feature file not found at: {self.ad_feature_path}")
-
-        lf = pl.scan_csv(self.ad_feature_path)
-        cols = lf.collect_schema().names()
-        rename_map = self._get_column_strip_map(cols)
-        if rename_map:
-            lf = lf.rename(rename_map)
-        return lf
+        return self._scan_csv_stripped(self.ad_feature_path)
 
     def scan_raw_sample(self) -> pl.LazyFrame:
         """
@@ -92,22 +87,11 @@ class CTRDataLoader:
         Returns:
             pl.LazyFrame: LazyFrame of interaction logs.
         """
-        if not self.raw_sample_path.exists():
-            raise FileNotFoundError(f"Raw sample file not found at: {self.raw_sample_path}")
-
         # If a fixed sample_size is requested, use n_rows in scan_csv to read only required rows
         if self.sample_size is not None and self.sample_size > 0:
             logger.info(f"Lazily scanning raw_sample with limit n_rows={self.sample_size:,}...")
-            lf = pl.scan_csv(self.raw_sample_path, n_rows=self.sample_size)
-        else:
-            lf = pl.scan_csv(self.raw_sample_path)
-
-        cols = lf.collect_schema().names()
-        rename_map = self._get_column_strip_map(cols)
-        if rename_map:
-            lf = lf.rename(rename_map)
-
-        return lf
+            return self._scan_csv_stripped(self.raw_sample_path, n_rows=self.sample_size)
+        return self._scan_csv_stripped(self.raw_sample_path)
 
     def load_user_profile(self) -> pl.DataFrame:
         """
