@@ -19,10 +19,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATASET = "pavansanagapati/ad-displayclick-data-on-taobaocom"
-
-# Project root is two levels up from src/data (i.e. repository root)
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "raw"
+# Default destination directory: /home/hoangLD/Desktop/AIVIETNAM/Module-03/conquer/data
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[3] / "data"
 
 
 class KaggleHubDownloader:
