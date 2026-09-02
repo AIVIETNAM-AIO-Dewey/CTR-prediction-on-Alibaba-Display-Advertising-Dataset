@@ -16,6 +16,18 @@ class CTRDataCleaner:
     handles missing values, and performs relational joins.
     """
 
+    # Shared by clean_user_profile and merge_tables to avoid duplicated column lists.
+    USER_DEMOGRAPHIC_DTYPES: Dict[str, pl.DataType] = {
+        "cms_segid": pl.Int32,
+        "cms_group_id": pl.Int32,
+        "final_gender_code": pl.Int8,
+        "age_level": pl.Int8,
+        "pvalue_level": pl.Int8,
+        "shopping_level": pl.Int8,
+        "occupation": pl.Int8,
+        "new_user_class_level": pl.Int8,
+    }
+
     def __init__(
         self,
         user_missing_val: int = -1,
@@ -51,16 +63,14 @@ class CTRDataCleaner:
         """
         logger.info("Cleaning user_profile table...")
 
+        demographic_exprs = [
+            pl.col(col).cast(dtype, strict=False).fill_null(self.user_missing_val)
+            for col, dtype in self.USER_DEMOGRAPHIC_DTYPES.items()
+        ]
+
         user_clean = user_df.with_columns([
             pl.col("userid").cast(pl.UInt32, strict=False),
-            pl.col("cms_segid").cast(pl.Int32, strict=False).fill_null(self.user_missing_val),
-            pl.col("cms_group_id").cast(pl.Int32, strict=False).fill_null(self.user_missing_val),
-            pl.col("final_gender_code").cast(pl.Int8, strict=False).fill_null(self.user_missing_val),
-            pl.col("age_level").cast(pl.Int8, strict=False).fill_null(self.user_missing_val),
-            pl.col("pvalue_level").cast(pl.Int8, strict=False).fill_null(self.user_missing_val),
-            pl.col("shopping_level").cast(pl.Int8, strict=False).fill_null(self.user_missing_val),
-            pl.col("occupation").cast(pl.Int8, strict=False).fill_null(self.user_missing_val),
-            pl.col("new_user_class_level").cast(pl.Int8, strict=False).fill_null(self.user_missing_val),
+            *demographic_exprs,
         ])
 
         return user_clean
@@ -170,20 +180,9 @@ class CTRDataCleaner:
         merged = merged.join(user_df, left_on="user", right_on="userid", how="left")
 
         # 3. Impute demographics for unmatched users (approx 7% of raw users)
-        user_cols_dtypes = {
-            "cms_segid": pl.Int32,
-            "cms_group_id": pl.Int32,
-            "final_gender_code": pl.Int8,
-            "age_level": pl.Int8,
-            "pvalue_level": pl.Int8,
-            "shopping_level": pl.Int8,
-            "occupation": pl.Int8,
-            "new_user_class_level": pl.Int8,
-        }
-
         impute_expressions = [
             pl.col(col).fill_null(self.user_missing_val).cast(dtype).alias(col)
-            for col, dtype in user_cols_dtypes.items()
+            for col, dtype in self.USER_DEMOGRAPHIC_DTYPES.items()
             if col in merged.columns
         ]
 

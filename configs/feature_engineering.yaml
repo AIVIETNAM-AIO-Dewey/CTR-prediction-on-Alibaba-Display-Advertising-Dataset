@@ -1,0 +1,16 @@
+# ==============================================================================
+# CTR Prediction - Feature Engineering Configuration
+# ==============================================================================
+
+# Data Paths
+paths:
+  input_dir: "data/processed"   # Where preprocessed train/val/test.parquet live
+  output_dir: "data/processed"  # Where train_fe/val_fe/test_fe.parquet are written
+
+feature_engineering:
+  # Out-of-fold smoothed Bayesian target encoding for high-cardinality IDs
+  target_encoding:
+    columns: ["cate_id", "brand", "customer", "pid"]
+    smoothing: 20.0        # Higher = more shrinkage toward global CTR for rare categories
+    n_folds: 5             # K-fold count for out-of-fold encoding on the train partition
+    random_seed: 42
