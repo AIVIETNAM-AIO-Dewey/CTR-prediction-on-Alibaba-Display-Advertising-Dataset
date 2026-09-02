@@ -77,12 +77,15 @@ def run_baseline_pipeline(
     if run_lr:
         logger.info("\n" + "=" * 65)
         logger.info("TRAINING: Logistic Regression Baseline (Polars)")
-        logger.info("=" * 65)
+        use_sgd = len(dataset.X_train) > 500000
+        if use_sgd:
+            logger.info("Large dataset detected (>500k rows) -> Using scalable SGD (log_loss) solver.")
 
         lr_model = LogisticRegressionCTRModel(
             C=1.0,
             solver="lbfgs",
             max_iter=300,
+            use_sgd=use_sgd,
             categorical_features=dataset.categorical_features,
             numeric_features=dataset.numeric_features,
             random_state=random_seed,
