@@ -111,3 +111,5 @@ desktop.ini
 experiments/*
 notebook/kaggle_pipeline.ipynb
 src/data/*
+
+README.md
