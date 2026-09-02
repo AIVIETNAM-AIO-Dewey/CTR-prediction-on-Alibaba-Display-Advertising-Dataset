@@ -122,11 +122,16 @@ class LogisticRegressionCTRModel(BaseCTRModel):
         )
 
         if self.use_sgd:
+            # On massive datasets (20M+ rows), 5-15 epochs with early stopping is optimal
+            sgd_epochs = min(self.max_iter, 15)
             self.estimator = SGDClassifier(
                 loss="log_loss",
                 penalty=self.penalty,
                 alpha=self.sgd_alpha,
-                max_iter=self.max_iter,
+                max_iter=sgd_epochs,
+                tol=1e-3,
+                early_stopping=True,
+                n_iter_no_change=3,
                 random_state=self.random_state,
                 class_weight=self.class_weight,
             )
