@@ -39,9 +39,6 @@ CTR_Prediction/
 │
 ├── src/
 │   ├── __init__.py
-│   ├── data/                           # Automated dataset downloading and verification
-│   │   ├── __init__.py
-│   │   └── data_downloader.py          # Kaggle dataset downloader with CLI & credential check
 │   ├── preprocessing/                  # Data loading, cleaning, relational merging, and time-based splitting
 │   │   ├── __init__.py
 │   │   ├── data_loader.py              # High-performance Polars CSV loader with sampling support
@@ -117,13 +114,7 @@ cd CTR_Prediction
 pip install -r requirements.txt
 ```
 
-### 2. Download Raw Dataset
-Download and extract the Alibaba Display Advertising Dataset automatically using `kagglehub`:
-```bash
-python -m src.data.data_downloader
-```
-
-### 3. Running Data Preprocessing
+### 2. Running Data Preprocessing
 Process raw CSV files and generate `train.parquet`, `val.parquet`, and `test.parquet`:
 
 ```bash
@@ -137,7 +128,7 @@ python -m src.preprocessing.run_preprocessing --sample-fraction 0.05
 python -m src.preprocessing.run_preprocessing --full
 ```
 
-### 4. Running Feature Analysis
+### 3. Running Feature Analysis
 Launch Jupyter Notebook to inspect correlation heatmaps and diagnostic reports:
 ```bash
 jupyter notebook notebook/feature_analysis.ipynb
