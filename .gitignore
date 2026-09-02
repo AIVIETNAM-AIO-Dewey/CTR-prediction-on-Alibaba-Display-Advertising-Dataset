@@ -109,3 +109,5 @@ desktop.ini
 *.swp
 *.swo
 experiments/*
+notebook/kaggle_pipeline.ipynb
+src/data/*

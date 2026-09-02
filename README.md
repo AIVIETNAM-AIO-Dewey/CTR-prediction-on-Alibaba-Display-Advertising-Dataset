@@ -48,16 +48,12 @@ CTR_Prediction/
 │   │   ├── cleaner.py                  # Missing value imputation and relational table joins
 │   │   ├── preprocessor.py             # End-to-end preprocessing pipeline orchestrator
 │   │   └── run_preprocessing.py        # CLI entry point for data processing
-│   ├── features/                       # Feature engineering and transformation pipeline
-│   │   ├── feature_engineering.py      # Core feature engineering implementations in Polars
-│   │   └── run_feature_engineering.py  # CLI entry point for generating engineered partitions
-│   └── models/                         # Standardized baseline and ML model wrappers
-│       ├── __init__.py
-│       ├── base_model.py               # Abstract base model class with evaluation & serialization
-│       ├── data_utils.py               # Polars dataset loader and batch sampling utilities
-│       ├── logistic_regression_model.py # Logistic Regression baseline with One-Hot encoding & scaling
-│       ├── lightgbm_model.py           # LightGBM GBDT model with early stopping & categorical handling
-│       └── run_baseline.py             # Unified CLI entry point to train, evaluate, and compare models
+│   ├── features/                       # Feature engineering: exposure, price, cyclical time, cross, target encoding
+│   │   ├── __init__.py
+│   │   ├── feature_engineer.py         # CTRFeatureEngineer pipeline orchestrator
+│   │   └── run_feature_engineering.py  # CLI entry point for feature engineering
+│   ├── model/                          # Machine Learning model definitions and wrappers (Upcoming)
+│   └── evaluate/                       # Model evaluation, metric calculation, and SHAP diagnostics (Upcoming)
 │
 ├── models/                             # Serialized model artifacts (.joblib, .json)
 ├── experiments/                        # Experiment tracking logs and benchmark metrics
@@ -94,20 +90,24 @@ CTR_Prediction/
    - Formulation of the definitive Feature Decision Matrix.
 
 4. Feature Engineering Pipeline (`src/features/`):
-   - Exposure sequence counters (ad fatigue modeling).
-   - Log-price transformations and category-relative price ratios.
-   - Cyclical temporal transformations (`sin`/`cos` hour).
-   - Out-of-fold Bayesian smoothed target encodings for high-cardinality IDs (`cate_id`, `brand`, `customer`, `pid`).
-   - Output parquet generation (`train_fe.parquet`, `val_fe.parquet`, `test_fe.parquet`).
-
-5. Baseline Model Benchmarking (`src/models/`):
-   - Standardized OOP wrappers with uniform `fit()`, `predict_proba()`, `evaluate()`, and `save()`/`load()` interfaces.
-   - **Logistic Regression**: Scaled continuous features + One-Hot Encoded categoricals.
-   - **LightGBM**: Fast histogram-based GBDT with native Polars integration, early stopping, and metric tracking (ROC-AUC, LogLoss).
+   - Exposure sequence counters (`user_adgroup_exposure_seq`, `user_cate_exposure_seq`) modeling ad fatigue, computed over the full chronological history.
+   - Price transformations: `price_log` (`log1p(price)`) and `price_ratio_cate` (price relative to train-fitted per-`cate_id` median).
+   - Cyclical time encodings: sine/cosine pairs for `hour` and `day_of_week`.
+   - Cross features: `gender_x_cate` (`final_gender_code` x `cate_id`) and `pid_x_cate` (`pid` x `cate_id`).
+   - Out-of-fold smoothed Bayesian target encoding for high-cardinality IDs (`cate_id`, `brand`, `customer`, `pid`), fitted exclusively on train and frozen onto val/test to prevent leakage.
 
 ### Upcoming Phases
-6. Multi-Model Expansion & Hyperparameter Optimization:
-   - CatBoost and XGBoost implementations.
+5. Feature Selection:
+   - Automated feature selection module based on Mutual Information and LightGBM Gain.
+
+6. Multi-Model Machine Learning Experiments:
+   - Development of standardized wrappers for 4 tree-based algorithms:
+     - LightGBM: Fast histogram-based gradient boosting with native categorical handling.
+     - CatBoost: Ordered boosting with robust handling of categorical combinations.
+     - XGBoost: Exact and histogram-based gradient boosted trees.
+     - RandomForest: Bagging benchmark on stratified subsets.
+
+7. Hyperparameter Tuning, Explainability, and Ensembling:
    - Automated hyperparameter optimization using Optuna.
    - Global and local feature interpretability using SHAP.
    - Stacking / Ensembling of top-performing models for final submission.
@@ -195,6 +195,13 @@ python -m src.models.run_baseline --model lightgbm --use-fe --sample-size 100000
 Launch Jupyter Notebook to inspect correlation heatmaps and diagnostic reports:
 ```bash
 jupyter notebook notebook/feature_analysis.ipynb
+```
+
+### 4. Running Feature Engineering
+Reads `train.parquet` / `val.parquet` / `test.parquet` from `data/processed/` and writes engineered `train_fe.parquet`, `val_fe.parquet`, `test_fe.parquet`:
+
+```bash
+python -m src.features.run_feature_engineering --config configs/feature_engineering.yaml
 ```
 
 ## 5. Team Contribution Guidelines

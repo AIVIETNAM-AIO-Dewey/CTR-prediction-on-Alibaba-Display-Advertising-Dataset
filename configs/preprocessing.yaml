@@ -11,7 +11,7 @@ paths:
   train_output: "data/processed/train.parquet"
   val_output: "data/processed/val.parquet"
   test_output: "data/processed/test.parquet"
-  metadata_output: "data/processed/preprocessing_meta.joblib"
+  metadata_output: "data/processed/metadata.json"
 
 # Data Types Configuration for Memory Optimization
 dtypes:
