@@ -1,6 +1,6 @@
 """
 Abstract Base Class for CTR Prediction Models.
-Defines the standard interface for all model wrappers across the project.
+Defines the standard interface for all model wrappers across the project with native Polars support.
 """
 
 from abc import ABC, abstractmethod
@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Union
 import logging
 import numpy as np
 import polars as pl
-import pandas as pd
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -42,17 +41,17 @@ class BaseCTRModel(ABC):
     @abstractmethod
     def fit(
         self,
-        X_train: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
-        y_train: Union[pd.Series, pl.Series, np.ndarray],
-        X_val: Optional[Union[pd.DataFrame, pl.DataFrame, np.ndarray]] = None,
-        y_val: Optional[Union[pd.Series, pl.Series, np.ndarray]] = None,
+        X_train: Union[pl.DataFrame, np.ndarray],
+        y_train: Union[pl.Series, np.ndarray],
+        X_val: Optional[Union[pl.DataFrame, np.ndarray]] = None,
+        y_val: Optional[Union[pl.Series, np.ndarray]] = None,
         **kwargs: Any,
     ) -> "BaseCTRModel":
         """
         Train the model on the training partition with optional validation data.
 
         Args:
-            X_train: Feature matrix for training.
+            X_train: Feature matrix for training (Polars DataFrame preferred).
             y_train: Binary labels for training (0: non-click, 1: click).
             X_val: Optional feature matrix for validation / early stopping.
             y_val: Optional binary labels for validation.
@@ -66,13 +65,13 @@ class BaseCTRModel(ABC):
     @abstractmethod
     def predict_proba(
         self,
-        X: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
+        X: Union[pl.DataFrame, np.ndarray],
     ) -> np.ndarray:
         """
         Predict click-through probabilities for given features.
 
         Args:
-            X: Feature matrix.
+            X: Feature matrix (Polars DataFrame preferred).
 
         Returns:
             np.ndarray: 1D array of predicted click probabilities (p in [0.0, 1.0]).
@@ -81,7 +80,7 @@ class BaseCTRModel(ABC):
 
     def predict(
         self,
-        X: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
+        X: Union[pl.DataFrame, np.ndarray],
         threshold: float = 0.5,
     ) -> np.ndarray:
         """
@@ -99,8 +98,8 @@ class BaseCTRModel(ABC):
 
     def evaluate(
         self,
-        X: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
-        y: Union[pd.Series, pl.Series, np.ndarray],
+        X: Union[pl.DataFrame, np.ndarray],
+        y: Union[pl.Series, np.ndarray],
         dataset_name: str = "Test",
     ) -> Dict[str, float]:
         """
@@ -111,14 +110,14 @@ class BaseCTRModel(ABC):
         - Brier Score: Mean squared error of calibrated probabilities
 
         Args:
-            X: Feature matrix.
-            y: Ground truth binary labels.
+            X: Feature matrix (Polars DataFrame preferred).
+            y: Ground truth binary labels (Polars Series preferred).
             dataset_name: Label for logging (e.g. 'Val', 'Test').
 
         Returns:
             Dict[str, float]: Computed evaluation metrics.
         """
-        if isinstance(y, (pl.Series, pd.Series)):
+        if isinstance(y, pl.Series):
             y_true = y.to_numpy()
         else:
             y_true = np.asarray(y)
@@ -154,19 +153,5 @@ class BaseCTRModel(ABC):
 
         Args:
             filepath: Destination file path.
-        """
-        pass
-
-    @classmethod
-    @abstractmethod
-    def load(cls, filepath: Union[str, Path]) -> "BaseCTRModel":
-        """
-        Deserialize model from disk.
-
-        Args:
-            filepath: Path to saved model file.
-
-        Returns:
-            BaseCTRModel: Loaded instance.
         """
         pass

@@ -48,11 +48,19 @@ CTR_Prediction/
 │   │   ├── cleaner.py                  # Missing value imputation and relational table joins
 │   │   ├── preprocessor.py             # End-to-end preprocessing pipeline orchestrator
 │   │   └── run_preprocessing.py        # CLI entry point for data processing
-│   ├── model/                          # Machine Learning model definitions and wrappers (Upcoming)
-│   └── evaluate/                       # Model evaluation, metric calculation, and SHAP diagnostics (Upcoming)
+│   ├── features/                       # Feature engineering and transformation pipeline
+│   │   ├── feature_engineering.py      # Core feature engineering implementations in Polars
+│   │   └── run_feature_engineering.py  # CLI entry point for generating engineered partitions
+│   └── models/                         # Standardized baseline and ML model wrappers
+│       ├── __init__.py
+│       ├── base_model.py               # Abstract base model class with evaluation & serialization
+│       ├── data_utils.py               # Polars dataset loader and batch sampling utilities
+│       ├── logistic_regression_model.py # Logistic Regression baseline with One-Hot encoding & scaling
+│       ├── lightgbm_model.py           # LightGBM GBDT model with early stopping & categorical handling
+│       └── run_baseline.py             # Unified CLI entry point to train, evaluate, and compare models
 │
 ├── models/                             # Serialized model artifacts (.joblib, .json)
-├── experiments/                        # Experiment tracking logs and Optuna hyperparameter studies
+├── experiments/                        # Experiment tracking logs and benchmark metrics
 ├── outputs/                            # Evaluation plots, confusion matrices, and ROC curves
 ├── requirements.txt                    # Project dependencies
 ├── CONTRIBUTING.md                     # Team collaboration workflow and task roadmap
@@ -85,24 +93,24 @@ CTR_Prediction/
    - Mutual Information (MI) and Information Value (IV) ranking against the `clk` target.
    - Formulation of the definitive Feature Decision Matrix.
 
-### Upcoming Phases
-4. Feature Engineering and Feature Selection:
-   - Implementation of exposure sequence counters (ad fatigue modeling).
-   - Price transformations (`log1p(price)` and category-relative price ratios).
+4. Feature Engineering Pipeline (`src/features/`):
+   - Exposure sequence counters (ad fatigue modeling).
+   - Log-price transformations and category-relative price ratios.
+   - Cyclical temporal transformations (`sin`/`cos` hour).
    - Out-of-fold Bayesian smoothed target encodings for high-cardinality IDs (`cate_id`, `brand`, `customer`, `pid`).
-   - Automated feature selection module based on Mutual Information and LightGBM Gain.
+   - Output parquet generation (`train_fe.parquet`, `val_fe.parquet`, `test_fe.parquet`).
 
-5. Multi-Model Machine Learning Experiments:
-   - Development of standardized wrappers for 4 tree-based algorithms:
-     - LightGBM: Fast histogram-based gradient boosting with native categorical handling.
-     - CatBoost: Ordered boosting with robust handling of categorical combinations.
-     - XGBoost: Exact and histogram-based gradient boosted trees.
-     - RandomForest: Bagging benchmark on stratified subsets.
+5. Baseline Model Benchmarking (`src/models/`):
+   - Standardized OOP wrappers with uniform `fit()`, `predict_proba()`, `evaluate()`, and `save()`/`load()` interfaces.
+   - **Logistic Regression**: Scaled continuous features + One-Hot Encoded categoricals.
+   - **LightGBM**: Fast histogram-based GBDT with native Polars integration, early stopping, and metric tracking (ROC-AUC, LogLoss).
 
-6. Hyperparameter Tuning, Explainability, and Ensembling:
+### Upcoming Phases
+6. Multi-Model Expansion & Hyperparameter Optimization:
+   - CatBoost and XGBoost implementations.
    - Automated hyperparameter optimization using Optuna.
    - Global and local feature interpretability using SHAP.
-   - Ensembling / Stacking of top-performing models for final test submission.
+   - Stacking / Ensembling of top-performing models for final submission.
 
 ## 4. Quickstart Guide
 
@@ -112,6 +120,9 @@ Clone the repository and install required dependencies:
 # Clone repository
 git clone <repository_url>
 cd CTR_Prediction
+
+# Activate virtual environment
+source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
@@ -137,7 +148,50 @@ python -m src.preprocessing.run_preprocessing --sample-fraction 0.05
 python -m src.preprocessing.run_preprocessing --full
 ```
 
-### 4. Running Feature Analysis
+### 4. Running Feature Engineering
+Apply feature engineering transformations (exposure counters, price ratios, out-of-fold target encoding) to generate `train_fe.parquet`, `val_fe.parquet`, and `test_fe.parquet`:
+
+```bash
+python -m src.features.run_feature_engineering
+```
+
+### 5. Running Model Training & Evaluation
+Train and evaluate baseline models (Logistic Regression and LightGBM) on the preprocessed or feature-engineered datasets:
+
+#### **A. Train All Models**
+```bash
+# Quick prototype run (100,000 rows)
+python -m src.models.run_baseline --model all --use-fe --sample-size 100000
+
+# 5% sample run (~1.3M rows)
+python -m src.models.run_baseline --model all --use-fe --sample-fraction 0.05
+
+# Full dataset run
+python -m src.models.run_baseline --model all --use-fe --sample-size 0
+```
+
+#### **B. Train Individual Models**
+```bash
+# Logistic Regression only
+python -m src.models.run_baseline --model lr --use-fe --sample-size 100000
+
+# LightGBM only
+python -m src.models.run_baseline --model lightgbm --use-fe --sample-size 100000
+```
+
+#### **CLI Parameters Reference**
+| Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--model` | `str` | `all` | Model to run: `all`, `lr`, or `lightgbm` |
+| `--use-fe` | `flag` | `False` | Use feature-engineered partitions (`train_fe.parquet`) |
+| `--sample-size` | `int` | `100000` | Number of training rows to sample (`0` for full dataset) |
+| `--sample-fraction` | `float` | `None` | Sample fraction (e.g. `0.05` for 5%) |
+| `--processed-dir` | `str` | `data/processed` | Directory containing parquet dataset partitions |
+| `--models-dir` | `str` | `models` | Directory to save trained `.joblib` model artifacts |
+| `--output-metrics` | `str` | `experiments/baseline_results.json` | Destination path for evaluation metrics summary |
+| `--seed` | `int` | `42` | Random seed for sampling and reproducibility |
+
+### 6. Running Feature Analysis
 Launch Jupyter Notebook to inspect correlation heatmaps and diagnostic reports:
 ```bash
 jupyter notebook notebook/feature_analysis.ipynb
@@ -146,3 +200,4 @@ jupyter notebook notebook/feature_analysis.ipynb
 ## 5. Team Contribution Guidelines
 
 Refer to CONTRIBUTING.md for task assignments, code style rules, branch conventions, and submission workflows.
+

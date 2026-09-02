@@ -28,7 +28,7 @@ if str(ROOT_DIR) not in sys.path:
 import polars as pl
 import yaml
 
-from src.features.feature_engineer import CTRFeatureEngineer
+from src.features.feature_engineering import CTRFeatureEngineer
 
 logging.basicConfig(
     level=logging.INFO,

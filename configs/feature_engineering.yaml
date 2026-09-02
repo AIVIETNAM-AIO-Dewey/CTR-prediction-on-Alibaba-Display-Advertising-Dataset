@@ -1,0 +1,48 @@
+# ==============================================================================
+# CTR Prediction - Feature Engineering Configuration
+# ==============================================================================
+
+# Data Paths
+paths:
+  input_dir: "data/processed"
+  output_dir: "data/processed"
+  train_input: "data/processed/train.parquet"
+  val_input: "data/processed/val.parquet"
+  test_input: "data/processed/test.parquet"
+  train_fe_output: "data/processed/train_fe.parquet"
+  val_fe_output: "data/processed/val_fe.parquet"
+  test_fe_output: "data/processed/test_fe.parquet"
+  metadata_output: "data/processed/feature_metadata.json"
+
+# Feature Engineering Sub-module Configurations
+feature_engineering:
+  # Out-of-fold smoothed Bayesian Target Encoding
+  target_encoding:
+    columns:
+      - "cate_id"
+      - "brand"
+      - "customer"
+      - "pid"
+    smoothing: 20.0
+    n_folds: 5
+    random_seed: 42
+
+  # Price Transformations
+  price_features:
+    log_transform: true
+    ratio_to_cate_median: true
+
+  # Cyclical Time Encodings
+  cyclical_time:
+    hour: true
+    day_of_week: true
+
+  # Categorical Cross Features
+  cross_features:
+    - ["final_gender_code", "cate_id"]
+    - ["pid", "cate_id"]
+
+  # Exposure Sequences (Ad fatigue counters)
+  exposure_sequence:
+    - ["user", "adgroup_id"]
+    - ["user", "cate_id"]

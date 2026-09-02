@@ -1,7 +1,7 @@
 """
 Logistic Regression Baseline Model for CTR Prediction.
 Implements a standardized linear baseline with robust sparse categorical encoding,
-numeric scaling, and probability calibration.
+numeric scaling, probability calibration, and native Polars DataFrame processing.
 """
 
 from pathlib import Path
@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Union
 import logging
 import joblib
 import numpy as np
-import pandas as pd
 import polars as pl
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression, SGDClassifier
@@ -25,9 +24,11 @@ class LogisticRegressionCTRModel(BaseCTRModel):
     """
     Logistic Regression Model Wrapper for Click-Through Rate (CTR) Prediction.
     Features:
+    - Native Polars DataFrame processing.
     - Automated sparse One-Hot Encoding for categorical features with min_frequency / max_categories.
     - StandardScaler for numeric features.
     - End-to-end scikit-learn Pipeline with serialization.
+    - Top coefficients extraction returning Polars DataFrames.
     - Support for standard L-BFGS or scalable SGD (log-loss) for massive dataset partitions.
     """
 
@@ -130,15 +131,16 @@ class LogisticRegressionCTRModel(BaseCTRModel):
                 class_weight=self.class_weight,
             )
         else:
-            self.estimator = LogisticRegression(
-                C=self.C,
-                penalty=self.penalty,
-                solver=self.solver,
-                max_iter=self.max_iter,
-                random_state=self.random_state,
-                class_weight=self.class_weight,
-                n_jobs=-1 if self.solver in ("lbfgs", "saga") else 1,
-            )
+            lr_kwargs: Dict[str, Any] = {
+                "C": self.C,
+                "solver": self.solver,
+                "max_iter": self.max_iter,
+                "random_state": self.random_state,
+                "class_weight": self.class_weight,
+            }
+            if self.penalty and self.penalty != "l2":
+                lr_kwargs["penalty"] = self.penalty
+            self.estimator = LogisticRegression(**lr_kwargs)
 
         pipeline = Pipeline([
             ("preprocessor", self.preprocessor),
@@ -147,19 +149,49 @@ class LogisticRegressionCTRModel(BaseCTRModel):
 
         return pipeline
 
+    def _prepare_dataframe(
+        self,
+        df: Union[pl.DataFrame, np.ndarray],
+        cat_cols: List[str],
+    ) -> pl.DataFrame:
+        """
+        Format Polars DataFrame for Logistic Regression ColumnTransformer.
+        Ensures categorical columns are cast to string in Polars for robust OneHotEncoding.
+
+        Args:
+            df: Input feature matrix.
+            cat_cols: List of categorical column names.
+
+        Returns:
+            pl.DataFrame: Formatted Polars DataFrame.
+        """
+        if isinstance(df, np.ndarray):
+            df = pl.DataFrame(df, schema=self.feature_names)
+        elif not isinstance(df, pl.DataFrame):
+            raise TypeError("Expected Polars DataFrame or numpy ndarray.")
+
+        exprs = [
+            pl.col(c).cast(pl.String).alias(c)
+            for c in cat_cols
+            if c in df.columns
+        ]
+        if exprs:
+            df = df.with_columns(exprs)
+        return df
+
     def fit(
         self,
-        X_train: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
-        y_train: Union[pd.Series, pl.Series, np.ndarray],
-        X_val: Optional[Union[pd.DataFrame, pl.DataFrame, np.ndarray]] = None,
-        y_val: Optional[Union[pd.Series, pl.Series, np.ndarray]] = None,
+        X_train: Union[pl.DataFrame, np.ndarray],
+        y_train: Union[pl.Series, np.ndarray],
+        X_val: Optional[Union[pl.DataFrame, np.ndarray]] = None,
+        y_val: Optional[Union[pl.Series, np.ndarray]] = None,
         **kwargs: Any,
     ) -> "LogisticRegressionCTRModel":
         """
         Fit Logistic Regression pipeline on the training set.
 
         Args:
-            X_train: Training feature matrix.
+            X_train: Training feature matrix (Polars DataFrame preferred).
             y_train: Training labels (0 or 1).
             X_val: Optional validation features (evaluated after training).
             y_val: Optional validation labels.
@@ -168,13 +200,10 @@ class LogisticRegressionCTRModel(BaseCTRModel):
         Returns:
             self: The fitted model.
         """
-        if isinstance(X_train, pl.DataFrame):
-            X_train = X_train.to_pandas()
         if isinstance(y_train, pl.Series):
             y_train = y_train.to_numpy()
 
-        # Determine column lists
-        if isinstance(X_train, pd.DataFrame):
+        if isinstance(X_train, pl.DataFrame):
             self.feature_names = list(X_train.columns)
             cat_cols = self.categorical_features or [
                 c for c in self.feature_names if c != "price"
@@ -182,23 +211,28 @@ class LogisticRegressionCTRModel(BaseCTRModel):
             num_cols = self.numeric_features or [
                 c for c in self.feature_names if c == "price"
             ]
-            # Ensure categorical types are cast to object/string for OHE stability
-            X_train_processed = X_train.copy()
-            for col in cat_cols:
-                if col in X_train_processed.columns:
-                    X_train_processed[col] = X_train_processed[col].astype(str)
+        elif isinstance(X_train, np.ndarray):
+            self.feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
+            cat_cols = self.categorical_features or []
+            num_cols = self.numeric_features or self.feature_names
         else:
-            raise TypeError("X_train must be a pandas DataFrame or Polars DataFrame.")
+            raise TypeError("X_train must be a Polars DataFrame or numpy ndarray.")
 
-        logger.info(f"Building Logistic Regression pipeline ({len(cat_cols)} cat, {len(num_cols)} num features)...")
-        self.pipeline = self._build_pipeline(cat_cols, num_cols)
+        active_cat_cols = [c for c in cat_cols if c in self.feature_names]
+        active_num_cols = [c for c in num_cols if c in self.feature_names]
+
+        X_train_processed = self._prepare_dataframe(X_train, active_cat_cols)
+
+        logger.info(
+            f"Building Logistic Regression pipeline (Polars) ({len(active_cat_cols)} cat, {len(active_num_cols)} num features)..."
+        )
+        self.pipeline = self._build_pipeline(active_cat_cols, active_num_cols)
 
         logger.info(f"Fitting Logistic Regression model on {len(X_train_processed):,} training samples...")
         self.pipeline.fit(X_train_processed, y_train)
         self.is_fitted = True
         logger.info("✅ Logistic Regression model training completed successfully.")
 
-        # If validation data is provided, evaluate and log
         if X_val is not None and y_val is not None:
             self.evaluate(X_val, y_val, dataset_name="Validation")
 
@@ -206,13 +240,13 @@ class LogisticRegressionCTRModel(BaseCTRModel):
 
     def predict_proba(
         self,
-        X: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
+        X: Union[pl.DataFrame, np.ndarray],
     ) -> np.ndarray:
         """
         Predict click probability for input samples.
 
         Args:
-            X: Feature matrix.
+            X: Feature matrix (Polars DataFrame preferred).
 
         Returns:
             np.ndarray: 1D array of predicted click probabilities.
@@ -221,33 +255,28 @@ class LogisticRegressionCTRModel(BaseCTRModel):
             raise RuntimeError("Model has not been fitted yet. Call .fit() before predicting.")
 
         if isinstance(X, pl.DataFrame):
-            X = X.to_pandas()
-
-        if isinstance(X, pd.DataFrame):
-            X_eval = X.copy()
-            # Cast categorical columns to string matching training
             cat_cols = self.categorical_features or [
-                c for c in X_eval.columns if c != "price"
+                c for c in X.columns if c != "price"
             ]
-            for col in cat_cols:
-                if col in X_eval.columns:
-                    X_eval[col] = X_eval[col].astype(str)
+            X_eval = self._prepare_dataframe(X, cat_cols)
+        elif isinstance(X, np.ndarray):
+            cat_cols = self.categorical_features or []
+            X_eval = self._prepare_dataframe(X, cat_cols)
         else:
-            X_eval = X
+            raise TypeError("X must be a Polars DataFrame or numpy ndarray.")
 
-        # Predict probability for positive class (class 1: click)
         probas = self.pipeline.predict_proba(X_eval)
         return probas[:, 1]
 
-    def get_top_coefficients(self, top_k: int = 20) -> pd.DataFrame:
+    def get_top_coefficients(self, top_k: int = 20) -> pl.DataFrame:
         """
-        Extract top positive and negative feature coefficients from the fitted linear model.
+        Extract top positive and negative feature coefficients from the fitted linear model as a Polars DataFrame.
 
         Args:
             top_k: Number of top influential features to return.
 
         Returns:
-            pd.DataFrame: Table of feature names and linear weights.
+            pl.DataFrame: Table of feature names and linear weights.
         """
         if not self.is_fitted or self.pipeline is None:
             raise RuntimeError("Model is not fitted.")
@@ -258,11 +287,11 @@ class LogisticRegressionCTRModel(BaseCTRModel):
         feature_names = preprocessor.get_feature_names_out()
         coefficients = classifier.coef_[0]
 
-        df_coef = pd.DataFrame({
+        df_coef = pl.DataFrame({
             "feature": feature_names,
-            "coefficient": coefficients,
-            "abs_importance": np.abs(coefficients),
-        }).sort_values(by="abs_importance", ascending=False)
+            "coefficient": coefficients.astype(np.float64),
+            "abs_importance": np.abs(coefficients).astype(np.float64),
+        }).sort(by="abs_importance", descending=True)
 
         return df_coef.head(top_k)
 

@@ -4,11 +4,10 @@ Provides high-performance loading and preparation of train/val/test splits using
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import json
 import logging
 import polars as pl
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +20,11 @@ DEFAULT_EXCLUDE_COLS = [
     "date",
     "time_stamp",
     "user",
+    "userid",
+    "user_id",
 ]
 
-# Standard categorical feature list in the Alibaba CTR dataset
+# Standard categorical feature list in the Alibaba CTR dataset (raw + engineered)
 DEFAULT_CATEGORICAL_COLS = [
     "pid",
     "final_gender_code",
@@ -42,27 +43,46 @@ DEFAULT_CATEGORICAL_COLS = [
     "is_weekend",
     "day_of_week",
     "hour",
+    # Engineered Categorical Cross Features
+    "gender_x_cate",
+    "pid_x_cate",
 ]
 
-# Standard continuous / numeric feature list
+# Standard continuous / numeric feature list (raw + engineered)
 DEFAULT_NUMERIC_COLS = [
     "price",
+    # Engineered Exposure Sequence Features (Ad fatigue)
+    "user_adgroup_exposure_seq",
+    "user_cate_exposure_seq",
+    # Engineered Price Transforms
+    "price_log",
+    "price_ratio_cate",
+    # Engineered Cyclical Time Encodings
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    # Out-of-fold Smoothed Bayesian Target Encodings
+    "cate_id_te",
+    "brand_te",
+    "customer_te",
+    "pid_te",
 ]
 
 
 class CTRDataset:
     """
-    Container class holding Train, Validation, and Test feature matrices and labels.
+    Container class holding Polars Train, Validation, and Test feature matrices and labels.
     """
 
     def __init__(
         self,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: Optional[pd.DataFrame] = None,
-        y_val: Optional[pd.Series] = None,
-        X_test: Optional[pd.DataFrame] = None,
-        y_test: Optional[pd.Series] = None,
+        X_train: pl.DataFrame,
+        y_train: pl.Series,
+        X_val: Optional[pl.DataFrame] = None,
+        y_val: Optional[pl.Series] = None,
+        X_test: Optional[pl.DataFrame] = None,
+        y_test: Optional[pl.Series] = None,
         categorical_features: Optional[List[str]] = None,
         numeric_features: Optional[List[str]] = None,
     ):
@@ -80,10 +100,13 @@ class CTRDataset:
         return list(self.X_train.columns)
 
     def summary(self) -> Dict[str, Any]:
-        """Return dataset partition sizes and baseline CTRs."""
+        """Return dataset partition sizes and baseline CTRs using Polars."""
+        train_len = len(self.X_train)
+        train_ctr = float(self.y_train.mean() * 100)
+
         info = {
-            "train_samples": len(self.X_train),
-            "train_ctr": float(self.y_train.mean() * 100),
+            "train_samples": train_len,
+            "train_ctr": float(train_ctr),
             "num_features": len(self.feature_names),
             "categorical_features": len(self.categorical_features),
             "numeric_features": len(self.numeric_features),
@@ -103,42 +126,59 @@ def load_ctr_dataset(
     exclude_cols: Optional[List[str]] = None,
     categorical_cols: Optional[List[str]] = None,
     numeric_cols: Optional[List[str]] = None,
+    use_fe: bool = False,
     sample_size: Optional[int] = None,
     sample_fraction: Optional[float] = None,
     random_seed: int = 42,
 ) -> CTRDataset:
     """
-    Load preprocessed Parquet datasets and split into X and y for Train, Val, and Test.
+    Load preprocessed or feature-engineered Parquet datasets as native Polars DataFrames and Series.
 
     Args:
-        processed_dir: Directory containing train.parquet, val.parquet, and test.parquet.
+        processed_dir: Directory containing parquet files.
         target_col: Name of the binary target column (default: 'clk').
         exclude_cols: Columns to exclude from features (e.g. timestamps, identifiers).
         categorical_cols: Explicit list of categorical columns.
         numeric_cols: Explicit list of numeric/continuous columns.
+        use_fe: If True, loads engineered partitions (train_fe.parquet, etc.).
         sample_size: Optional row limit for rapid baseline testing.
         sample_fraction: Optional fraction for sampling (e.g. 0.1 for 10%).
         random_seed: Seed for sampling reproducibility.
 
     Returns:
-        CTRDataset: Object containing X/y splits and feature metadata.
+        CTRDataset: Object containing Polars X/y splits and feature metadata.
     """
     proc_path = Path(processed_dir)
-    train_path = proc_path / "train.parquet"
-    val_path = proc_path / "val.parquet"
-    test_path = proc_path / "test.parquet"
+
+    if use_fe:
+        train_path = proc_path / "train_fe.parquet"
+        val_path = proc_path / "val_fe.parquet"
+        test_path = proc_path / "test_fe.parquet"
+        if not train_path.exists():
+            logger.warning(
+                f"Engineered dataset {train_path} not found. Falling back to train.parquet."
+            )
+            train_path = proc_path / "train.parquet"
+            val_path = proc_path / "val.parquet"
+            test_path = proc_path / "test.parquet"
+    else:
+        train_path = proc_path / "train.parquet"
+        val_path = proc_path / "val.parquet"
+        test_path = proc_path / "test.parquet"
 
     if not train_path.exists():
-        raise FileNotFoundError(f"Training dataset not found at {train_path}. Run preprocessing first.")
+        raise FileNotFoundError(
+            f"Training dataset not found at {train_path}. Run preprocessing / feature engineering first."
+        )
 
-    logger.info(f"Loading datasets from {proc_path}...")
+    logger.info(f"Loading datasets from {train_path.parent} (Training file: {train_path.name})...")
     train_pl = pl.read_parquet(train_path)
     val_pl = pl.read_parquet(val_path) if val_path.exists() else None
     test_pl = pl.read_parquet(test_path) if test_path.exists() else None
 
     # Apply sampling if specified
     if sample_size is not None and sample_size < len(train_pl):
-        logger.info(f"Sampling training set to {sample_size:,} rows...")
+        logger.info(f"Sampling training set to {sample_size:,} rows with Polars...")
         train_pl = train_pl.sample(n=sample_size, seed=random_seed)
         if val_pl is not None:
             val_sample = min(int(sample_size * 0.2), len(val_pl))
@@ -147,7 +187,7 @@ def load_ctr_dataset(
             test_sample = min(int(sample_size * 0.2), len(test_pl))
             test_pl = test_pl.sample(n=test_sample, seed=random_seed)
     elif sample_fraction is not None and 0.0 < sample_fraction < 1.0:
-        logger.info(f"Sampling dataset with fraction {sample_fraction:.2%}...")
+        logger.info(f"Sampling dataset with fraction {sample_fraction:.2%} with Polars...")
         train_pl = train_pl.sample(fraction=sample_fraction, seed=random_seed)
         if val_pl is not None:
             val_pl = val_pl.sample(fraction=sample_fraction, seed=random_seed)
@@ -166,22 +206,24 @@ def load_ctr_dataset(
     active_cats = [c for c in cat_candidates if c in feature_cols]
     active_nums = [c for c in num_candidates if c in feature_cols]
 
-    # Convert to Pandas for model compatibility
-    train_pd = train_pl.select(feature_cols + [target_col]).to_pandas()
-    X_train = train_pd[feature_cols]
-    y_train = train_pd[target_col]
+    # Safety: dynamically catch any unlisted numerical columns so remainder="drop" doesn't drop them
+    for col in feature_cols:
+        if col not in active_cats and col not in active_nums:
+            col_dtype = train_pl.schema.get(col)
+            if col_dtype in (pl.Categorical, pl.Utf8, pl.String, pl.Object):
+                active_cats.append(col)
+            else:
+                active_nums.append(col)
 
-    X_val, y_val = None, None
-    if val_pl is not None:
-        val_pd = val_pl.select(feature_cols + [target_col]).to_pandas()
-        X_val = val_pd[feature_cols]
-        y_val = val_pd[target_col]
+    # Keep native Polars DataFrames and Series
+    X_train = train_pl.select(feature_cols)
+    y_train = train_pl.select(target_col).to_series()
 
-    X_test, y_test = None, None
-    if test_pl is not None:
-        test_pd = test_pl.select(feature_cols + [target_col]).to_pandas()
-        X_test = test_pd[feature_cols]
-        y_test = test_pd[target_col]
+    X_val = val_pl.select(feature_cols) if val_pl is not None else None
+    y_val = val_pl.select(target_col).to_series() if val_pl is not None else None
+
+    X_test = test_pl.select(feature_cols) if test_pl is not None else None
+    y_test = test_pl.select(target_col).to_series() if test_pl is not None else None
 
     dataset = CTRDataset(
         X_train=X_train,
@@ -196,7 +238,7 @@ def load_ctr_dataset(
 
     summary = dataset.summary()
     logger.info(
-        f"CTRDataset Loaded -> Train: {summary['train_samples']:,} rows (CTR: {summary['train_ctr']:.3f}%) | "
+        f"CTRDataset Loaded (Polars) -> Train: {summary['train_samples']:,} rows (CTR: {summary['train_ctr']:.3f}%) | "
         f"Val: {summary.get('val_samples', 0):,} rows | Test: {summary.get('test_samples', 0):,} rows | "
         f"Features: {summary['num_features']} ({summary['categorical_features']} cat, {summary['numeric_features']} num)"
     )

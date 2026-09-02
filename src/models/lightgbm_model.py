@@ -1,19 +1,24 @@
 """
 LightGBM Model Wrapper for CTR Prediction.
-Implements high-performance gradient boosted decision trees with native categorical support,
+Implements high-performance gradient boosted decision trees with native Polars DataFrame support,
 histogram binning, early stopping, and feature importance diagnostics.
 """
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import logging
+import warnings
 import joblib
 import lightgbm as lgb
 import numpy as np
-import pandas as pd
 import polars as pl
 
 from src.models.base_model import BaseCTRModel
+
+# Filter harmless lightgbm scikit-learn API deprecation warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
+warnings.filterwarnings("ignore", message=".*eval_set.*")
+warnings.filterwarnings("ignore", message=".*LGBMDeprecationWarning.*")
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +27,10 @@ class LightGBMCTRModel(BaseCTRModel):
     """
     LightGBM Model Wrapper for Click-Through Rate (CTR) Prediction.
     Key Capabilities:
-    - Native categorical feature handling (optimal histogram-based split finding).
+    - Native Polars DataFrame processing with zero memory duplication.
+    - Automatic categorical encoding and null-handling for LightGBM.
     - Validation-based Early Stopping monitoring LogLoss and ROC-AUC.
-    - Feature importance analysis (Gain and Split counts).
+    - Feature importance analysis returning Polars DataFrames.
     - Compact serialization and artifact restoration.
     """
 
@@ -36,7 +42,7 @@ class LightGBMCTRModel(BaseCTRModel):
         learning_rate: float = 0.05,
         num_leaves: int = 63,
         max_depth: int = -1,
-        min_child_samples: int = 50,
+        min_child_samples: int = 20,
         subsample: float = 0.8,
         subsample_freq: int = 1,
         colsample_bytree: float = 0.8,
@@ -47,6 +53,7 @@ class LightGBMCTRModel(BaseCTRModel):
         categorical_features: Optional[List[str]] = None,
         random_state: int = 42,
         n_jobs: int = -1,
+        verbose: int = -1,
         config: Optional[Dict[str, Any]] = None,
     ):
         """
@@ -70,6 +77,7 @@ class LightGBMCTRModel(BaseCTRModel):
             categorical_features: Explicit list of categorical column names.
             random_state: Random seed for reproducibility.
             n_jobs: Number of parallel CPU threads.
+            verbose: Verbosity level (-1 to suppress noisy engine warnings).
             config: Additional hyperparameter dictionary overriding defaults.
         """
         super().__init__(model_name="LightGBM", config=config)
@@ -91,6 +99,7 @@ class LightGBMCTRModel(BaseCTRModel):
         self.categorical_features = categorical_features
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.verbose = verbose
 
         self.estimator: Optional[lgb.LGBMClassifier] = None
         self.best_iteration_: Optional[int] = None
@@ -98,35 +107,61 @@ class LightGBMCTRModel(BaseCTRModel):
 
     def _prepare_dataframe(
         self,
-        df: Union[pd.DataFrame, pl.DataFrame],
-        cat_cols: List[str],
-    ) -> pd.DataFrame:
+        df: Union[pl.DataFrame, np.ndarray],
+        cat_cols: Optional[List[str]] = None,
+    ) -> pl.DataFrame:
         """
-        Cast categorical columns to pandas 'category' dtype for native LightGBM handling.
+        Format Polars DataFrame for LightGBM training.
+        - Converts negative sentinel values (-1) in categoricals to nulls.
+        - Hashes strings/categoricals into non-negative integer codes.
 
         Args:
-            df: Input feature DataFrame.
-            cat_cols: List of column names to treat as categorical.
+            df: Input feature matrix.
+            cat_cols: Optional list of categorical column names.
 
         Returns:
-            pd.DataFrame: Formatted DataFrame.
+            pl.DataFrame: Formatted Polars DataFrame.
         """
-        if isinstance(df, pl.DataFrame):
-            df = df.to_pandas()
+        if isinstance(df, np.ndarray):
+            df = pl.DataFrame(df, schema=self.feature_names)
+        elif not isinstance(df, pl.DataFrame):
+            raise TypeError("Expected Polars DataFrame or numpy ndarray.")
 
-        df_out = df.copy()
-        for col in cat_cols:
-            if col in df_out.columns:
-                df_out[col] = df_out[col].astype("category")
+        active_cats = set(cat_cols or self.categorical_features or [])
+        exprs = []
+        for col in df.columns:
+            dtype = df.schema.get(col)
+            if dtype in (pl.Utf8, pl.String, pl.Categorical, pl.Object):
+                # Hash string categories into positive 31-bit integers for LightGBM
+                exprs.append(
+                    (pl.col(col).cast(pl.String).hash(seed=self.random_state) % (2**31 - 1))
+                    .cast(pl.Int32)
+                    .alias(col)
+                )
+            elif dtype == pl.Boolean:
+                exprs.append(pl.col(col).cast(pl.Int8).alias(col))
+            elif col in active_cats and dtype in (
+                pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Float32, pl.Float64
+            ):
+                # Replace negative sentinel missing values (-1) with null to avoid negative category warning
+                exprs.append(
+                    pl.when(pl.col(col) < 0)
+                    .then(None)
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                )
 
-        return df_out
+        if exprs:
+            df = df.with_columns(exprs)
+
+        return df
 
     def fit(
         self,
-        X_train: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
-        y_train: Union[pd.Series, pl.Series, np.ndarray],
-        X_val: Optional[Union[pd.DataFrame, pl.DataFrame, np.ndarray]] = None,
-        y_val: Optional[Union[pd.Series, pl.Series, np.ndarray]] = None,
+        X_train: Union[pl.DataFrame, np.ndarray],
+        y_train: Union[pl.Series, np.ndarray],
+        X_val: Optional[Union[pl.DataFrame, np.ndarray]] = None,
+        y_val: Optional[Union[pl.Series, np.ndarray]] = None,
         early_stopping_rounds: int = 50,
         verbose_eval: int = 50,
         **kwargs: Any,
@@ -135,7 +170,7 @@ class LightGBMCTRModel(BaseCTRModel):
         Fit LightGBM model with optional validation and early stopping.
 
         Args:
-            X_train: Training features.
+            X_train: Training features (Polars DataFrame preferred).
             y_train: Training labels (0 or 1).
             X_val: Validation features for early stopping.
             y_val: Validation labels.
@@ -152,17 +187,23 @@ class LightGBMCTRModel(BaseCTRModel):
             y_val = y_val.to_numpy()
 
         if isinstance(X_train, pl.DataFrame):
-            X_train = X_train.to_pandas()
-
-        if isinstance(X_train, pd.DataFrame):
             self.feature_names = list(X_train.columns)
             cat_cols = self.categorical_features or [
                 c for c in self.feature_names if c != "price"
             ]
+        elif isinstance(X_train, np.ndarray):
+            self.feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
+            cat_cols = self.categorical_features or []
         else:
-            raise TypeError("X_train must be a pandas DataFrame or Polars DataFrame.")
+            raise TypeError("X_train must be a Polars DataFrame or numpy ndarray.")
 
-        X_train_df = self._prepare_dataframe(X_train, cat_cols)
+        active_cat_cols = [c for c in cat_cols if c in self.feature_names]
+        X_train_df = self._prepare_dataframe(X_train, active_cat_cols)
+
+        # Scale min_child_samples automatically if sample size is small
+        min_child = self.min_child_samples
+        if len(X_train) < 5000:
+            min_child = max(5, min(self.min_child_samples, max(5, int(len(X_train) * 0.02))))
 
         # Initialize LGBMClassifier
         self.estimator = lgb.LGBMClassifier(
@@ -171,7 +212,7 @@ class LightGBMCTRModel(BaseCTRModel):
             learning_rate=self.learning_rate,
             num_leaves=self.num_leaves,
             max_depth=self.max_depth,
-            min_child_samples=self.min_child_samples,
+            min_child_samples=min_child,
             subsample=self.subsample,
             subsample_freq=self.subsample_freq,
             colsample_bytree=self.colsample_bytree,
@@ -182,13 +223,14 @@ class LightGBMCTRModel(BaseCTRModel):
             random_state=self.random_state,
             n_jobs=self.n_jobs,
             importance_type="gain",
+            verbose=self.verbose,
         )
 
         callbacks = []
         eval_set = None
 
         if X_val is not None and y_val is not None:
-            X_val_df = self._prepare_dataframe(X_val, cat_cols)
+            X_val_df = self._prepare_dataframe(X_val, active_cat_cols)
             eval_set = [(X_train_df, y_train), (X_val_df, y_val)]
             eval_names = ["train", "val"]
 
@@ -200,8 +242,8 @@ class LightGBMCTRModel(BaseCTRModel):
             eval_names = None
 
         logger.info(
-            f"Training LightGBM on {len(X_train_df):,} samples with {len(self.feature_names)} features "
-            f"({len(cat_cols)} categorical, native handling enabled)..."
+            f"Training LightGBM (Polars) on {len(X_train_df):,} samples with {len(self.feature_names)} features "
+            f"({len(active_cat_cols)} categorical features, min_child_samples={min_child})..."
         )
 
         self.estimator.fit(
@@ -210,7 +252,7 @@ class LightGBMCTRModel(BaseCTRModel):
             eval_set=eval_set,
             eval_names=eval_names,
             eval_metric=self.metric,
-            categorical_feature=cat_cols,
+            categorical_feature=active_cat_cols if active_cat_cols else "auto",
             callbacks=callbacks,
             **kwargs,
         )
@@ -228,13 +270,13 @@ class LightGBMCTRModel(BaseCTRModel):
 
     def predict_proba(
         self,
-        X: Union[pd.DataFrame, pl.DataFrame, np.ndarray],
+        X: Union[pl.DataFrame, np.ndarray],
     ) -> np.ndarray:
         """
         Predict click probability for input samples.
 
         Args:
-            X: Feature matrix.
+            X: Feature matrix (Polars DataFrame preferred).
 
         Returns:
             np.ndarray: 1D array of predicted click probabilities.
@@ -242,11 +284,7 @@ class LightGBMCTRModel(BaseCTRModel):
         if not self.is_fitted or self.estimator is None:
             raise RuntimeError("Model is not fitted. Call .fit() before predicting.")
 
-        cat_cols = self.categorical_features or [
-            c for c in self.feature_names if c != "price"
-        ]
-        X_eval = self._prepare_dataframe(X, cat_cols)
-
+        X_eval = self._prepare_dataframe(X)
         probas = self.estimator.predict_proba(X_eval)
         return probas[:, 1]
 
@@ -254,28 +292,28 @@ class LightGBMCTRModel(BaseCTRModel):
         self,
         importance_type: str = "gain",
         top_k: Optional[int] = None,
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         """
-        Extract feature importances from the fitted LightGBM model.
+        Extract feature importances from the fitted LightGBM model as a Polars DataFrame.
 
         Args:
             importance_type: 'gain' (total split gain) or 'split' (number of splits).
             top_k: Optional limit on number of top features to return.
 
         Returns:
-            pd.DataFrame: Table of feature names and relative importances.
+            pl.DataFrame: Table of feature names and relative importances.
         """
         if not self.is_fitted or self.estimator is None:
             raise RuntimeError("Model is not fitted.")
 
         raw_importance = self.estimator.booster_.feature_importance(importance_type=importance_type)
-        total = np.sum(raw_importance) if np.sum(raw_importance) > 0 else 1.0
+        total = float(np.sum(raw_importance)) if np.sum(raw_importance) > 0 else 1.0
 
-        df_imp = pd.DataFrame({
+        df_imp = pl.DataFrame({
             "feature": self.feature_names,
-            "importance": raw_importance,
-            "relative_importance_%": (raw_importance / total) * 100.0,
-        }).sort_values(by="importance", ascending=False)
+            "importance": raw_importance.astype(np.float64),
+            "relative_importance_%": ((raw_importance / total) * 100.0).astype(np.float64),
+        }).sort(by="importance", descending=True)
 
         if top_k is not None:
             return df_imp.head(top_k)

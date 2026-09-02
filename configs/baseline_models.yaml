@@ -18,6 +18,8 @@ features:
     - "date"
     - "time_stamp"
     - "user"
+    - "userid"
+    - "user_id"
 
   categorical:
     - "pid"
@@ -37,9 +39,23 @@ features:
     - "is_weekend"
     - "day_of_week"
     - "hour"
+    - "gender_x_cate"
+    - "pid_x_cate"
 
   numeric:
     - "price"
+    - "user_adgroup_exposure_seq"
+    - "user_cate_exposure_seq"
+    - "price_log"
+    - "price_ratio_cate"
+    - "hour_sin"
+    - "hour_cos"
+    - "dow_sin"
+    - "dow_cos"
+    - "cate_id_te"
+    - "brand_te"
+    - "customer_te"
+    - "pid_te"
 
 # Logistic Regression Baseline Hyperparameters
 logistic_regression:
@@ -59,7 +75,7 @@ lightgbm:
   learning_rate: 0.05
   num_leaves: 63
   max_depth: -1
-  min_child_samples: 50
+  min_child_samples: 20
   subsample: 0.8
   subsample_freq: 1
   colsample_bytree: 0.8
@@ -68,6 +84,7 @@ lightgbm:
   n_estimators: 1000
   early_stopping_rounds: 50
   scale_pos_weight: 1.0
+  verbose: -1
   metric:
     - "binary_logloss"
     - "auc"
