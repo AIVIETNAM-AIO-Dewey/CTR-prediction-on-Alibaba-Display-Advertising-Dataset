@@ -1,0 +1,127 @@
+# ==============================================================================
+# CTR Prediction - Tree Model Configuration (CatBoost & XGBoost)
+# ==============================================================================
+
+# Data Paths
+paths:
+  processed_dir: "data/processed"
+  models_dir: "models"
+  results_output: "experiments/tree_models_results.json"
+
+# Features Configuration
+features:
+  target: "clk"
+
+  # Dropped per the Dual-Scope Feature Decision Matrix (notebook/feature_analysis.ipynb):
+  # - nonclk: direct label leakage
+  # - user / adgroup_id / time_stamp: high-cardinality keys, consumed by feature engineering only
+  # - cms_segid: severe collinearity with cms_group_id (Cramer's V >= 0.85)
+  exclude_cols:
+    - "clk"
+    - "nonclk"
+    - "datetime"
+    - "date"
+    - "time_stamp"
+    - "user"
+    - "userid"
+    - "user_id"
+    - "adgroup_id"
+    - "cms_segid"
+
+  categorical:
+    - "pid"
+    - "final_gender_code"
+    - "age_level"
+    - "pvalue_level"
+    - "shopping_level"
+    - "occupation"
+    - "new_user_class_level"
+    - "cms_group_id"
+    - "cate_id"
+    - "brand"
+    - "customer"
+    - "campaign_id"
+    - "is_weekend"
+    - "day_of_week"
+    - "hour"
+    - "gender_x_cate"
+    - "pid_x_cate"
+
+  numeric:
+    - "price"
+    - "user_adgroup_exposure_seq"
+    - "user_cate_exposure_seq"
+    - "price_log"
+    - "price_ratio_cate"
+    - "hour_sin"
+    - "hour_cos"
+    - "dow_sin"
+    - "dow_cos"
+    - "cate_id_te"
+    - "brand_te"
+    - "customer_te"
+    - "pid_te"
+
+# CatBoost Hyperparameters
+catboost:
+  loss_function: "Logloss"
+  # Early stopping tracks Logloss, not AUC: AUC saturates within a handful of iterations on this
+  # dataset and the overfitting detector then cuts training before probabilities are calibrated
+  # (measured on a 1M-row sample: AUC-stopped -> LogLoss 0.448 / Brier 0.131 at iteration 4;
+  #  Logloss-stopped -> LogLoss 0.196 / Brier 0.047 at iteration 86, with a higher test AUC).
+  eval_metric: "Logloss"
+  iterations: 2000
+  learning_rate: 0.05
+  depth: 8
+  l2_leaf_reg: 3.0
+  border_count: 128
+  one_hot_max_size: 10
+  max_ctr_complexity: 2          # Automatic categorical combinations (0 to disable, cheaper)
+  bootstrap_type: "Bernoulli"
+  subsample: 0.8
+  rsm: 0.8
+  boosting_type: "Plain"         # 'Ordered' is less biased but far slower on 20M+ rows
+  scale_pos_weight: 1.0          # Keep at 1.0 to preserve probability calibration (LogLoss)
+  early_stopping_rounds: 100
+  task_type: "CPU"               # Set to 'GPU' when a CUDA device is available
+  thread_count: -1
+  random_state: 42
+  verbose: 100
+
+# XGBoost Hyperparameters
+xgboost:
+  objective: "binary:logistic"
+  eval_metric:                   # Early stopping tracks the LAST metric listed -> logloss
+    - "auc"
+    - "logloss"
+  tree_method: "hist"
+  n_estimators: 2000
+  learning_rate: 0.05
+  max_depth: 8
+  min_child_weight: 50.0          # Tightened from 10: measured train-AUC 0.696 vs val-AUC 0.595 at 5M rows
+  gamma: 0.0
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  scale_pos_weight: 1.0
+  max_bin: 256
+  max_cat_to_onehot: 8
+  max_cat_threshold: 16           # Tightened from 64 to limit categorical split memorization
+  grow_policy: "depthwise"
+  early_stopping_rounds: 100
+  device: "cpu"                  # Set to 'cuda' when a CUDA device is available
+  n_jobs: -1
+  random_state: 42
+  verbosity: 1
+  verbose_eval: 50
+
+  # XGBoost splits on raw categorical levels, so it memorized advertiser identifiers:
+  # `customer` (255K levels), `brand` (100K) and `campaign_id` (423K) absorbed 41% of total gain
+  # and early stopping fired at iteration 52/2000. These two are dropped because feature
+  # engineering already provides smoothed out-of-fold encodings of the same entities
+  # (`customer_te`, `brand_te`). `campaign_id` is kept: it has no target-encoded counterpart yet,
+  # so dropping it would remove the signal entirely rather than regularize it.
+  drop_features:
+    - "customer"
+    - "brand"
