@@ -23,7 +23,8 @@ CTR_Prediction/
 │   ├── preprocessing.yaml              # Preprocessing configurations, paths, schema types, and split dates
 │   ├── feature_engineering.yaml        # Feature engineering and target encoding configuration
 │   ├── catboost.yaml                   # CatBoost: feature scoping, sampling, and hyperparameters
-│   └── xgboost.yaml                    # XGBoost: feature scoping, sampling, and hyperparameters
+│   ├── xgboost.yaml                    # XGBoost: feature scoping, sampling, and hyperparameters
+│   └── random_forest.yaml              # Random Forest: feature scoping, sampling, and hyperparameters
 │
 ├── data/
 │   ├── raw/                            # Input raw CSV files (ignored by Git)
@@ -39,7 +40,7 @@ CTR_Prediction/
 ├── notebook/
 │   ├── EDA.ipynb                       # Exploratory Data Analysis and raw data distributions
 │   ├── feature_analysis.ipynb          # Correlation diagnostics, Cramer's V, Mutual Information, and Decision Matrix
-│   └── tree_models_training.ipynb      # Kaggle/local driver: fits both tree models and verifies the BaseCTRModel contract
+│   └── tree_models_training.ipynb      # Kaggle/local driver: fits all three tree models and verifies the BaseCTRModel contract
 │
 ├── src/
 │   ├── __init__.py
@@ -58,10 +59,12 @@ CTR_Prediction/
 │   │   ├── base_model.py               # BaseCTRModel abstract interface and shared benchmark metrics
 │   │   ├── catboost_model.py           # CatBoost wrapper (ordered target statistics on native categoricals)
 │   │   ├── xgboost_model.py            # XGBoost wrapper (histogram trees with native categorical splits)
+│   │   ├── random_forest_model.py      # Random Forest wrapper (bagging baseline, ordinal-encoded categoricals)
 │   │   ├── data_utils.py               # CTRDataset container and Polars parquet split loader
 │   │   ├── train.py                    # Shared config-driven fitting logic (one config == one model)
 │   │   ├── run_catboost.py             # CLI entry point: fit CatBoost only
-│   │   └── run_xgboost.py              # CLI entry point: fit XGBoost only
+│   │   ├── run_xgboost.py              # CLI entry point: fit XGBoost only
+│   │   └── run_random_forest.py        # CLI entry point: fit Random Forest only
 │   └── evaluate/                       # Model evaluation, metric calculation, and SHAP diagnostics (Upcoming)
 │
 ├── models/                             # Serialized model artifacts (.joblib, .json)
@@ -110,7 +113,8 @@ CTR_Prediction/
    - Benchmark metrics on every partition: ROC-AUC, LogLoss, PR-AUC (Average Precision), and Brier score.
    - CatBoost wrapper: ordered boosting with native high-cardinality categorical handling via target statistics and automatic feature combinations.
    - XGBoost wrapper: histogram trees with native categorical splits (`enable_categorical`), using category dictionaries fitted on train only and frozen onto val/test.
-   - One config and one entry point per model (`configs/catboost.yaml` + `run_catboost`, `configs/xgboost.yaml` + `run_xgboost`), so a training run never starts the other model as a side effect.
+   - Random Forest wrapper: scikit-learn bagging baseline over ordinal-encoded categoricals, dictionaries fitted on train only, unseen levels mapped to a single out-of-vocabulary code.
+   - One config and one entry point per model (`catboost`, `xgboost`, `random_forest`), so a training run never starts another model as a side effect.
    - Feature scoping driven by each model's own config, dropping `nonclk`, `user`, `adgroup_id`, `time_stamp`, and the collinear `cms_segid` per the Feature Decision Matrix. XGBoost additionally drops `customer` / `brand`, which it memorizes as raw IDs; CatBoost keeps them because ordered target statistics already regularize them.
    - Fitting stops at the artifact: the runners persist `models/<model>_fe.joblib` plus a training manifest and compute no metrics. Per CONTRIBUTING.md this is Task 3; metrics and plots are Task 4 (`src/evaluate/`) and hyperparameter search is Task 5 (`experiments/tune_optuna.py`).
 
@@ -167,7 +171,7 @@ Reads `train.parquet` / `val.parquet` / `test.parquet` from `data/processed/` an
 python -m src.features.run_feature_engineering --config configs/feature_engineering.yaml
 ```
 
-### 5. Fitting the Tree Models (CatBoost & XGBoost)
+### 5. Fitting the Tree Models (CatBoost, XGBoost, Random Forest)
 Each model has its own config and its own entry point, so one command trains exactly one model.
 Both read `train_fe.parquet` / `val_fe.parquet` / `test_fe.parquet`, train with early stopping on
 the validation partition, and write `models/<model>_fe.joblib` plus a training manifest to
@@ -177,6 +181,7 @@ the validation partition, and write `models/<model>_fe.joblib` plus a training m
 # Smoke runs on the sample size declared in each config
 python -m src.models.run_catboost
 python -m src.models.run_xgboost
+python -m src.models.run_random_forest
 
 # Full engineered dataset
 python -m src.models.run_catboost --sample-size 0
@@ -187,15 +192,20 @@ python -m src.models.run_catboost --sample-fraction 0.05
 ```
 
 Hyperparameters, the feature scope, the categorical / numeric split, and the default sampling all
-live in `configs/catboost.yaml` and `configs/xgboost.yaml`; CLI flags override the `data:` block.
-Set `params.task_type: GPU` (CatBoost) or `params.device: cuda` (XGBoost) to train on a CUDA device.
+live in `configs/<model>.yaml`; CLI flags override the `data:` block. Set `params.task_type: GPU`
+(CatBoost) or `params.device: cuda` (XGBoost) to train on a CUDA device; Random Forest is CPU-only.
+
+Each config scopes its own features. XGBoost drops `customer` / `brand`, which it memorizes as raw
+IDs; Random Forest additionally drops `campaign_id`, since an ordinal code over hundreds of
+thousands of levels carries no usable order for a split. Both rely on the `*_te` target encodings
+instead. CatBoost keeps all three - ordered target statistics already regularize them.
 
 **These runners produce no metrics — that is deliberate.** Fitting ends at the persisted artifact.
 
 ### 6. Fitting on Kaggle
 `notebook/tree_models_training.ipynb` is the same fitting step packaged for a Kaggle kernel,
 which is easier than a laptop for the full ~20M-row engineered partition. It clones this repo,
-fits both models through `fit_from_config` (the same function the CLI runners call), verifies the
+fits all three models through `fit_from_config` (the same function the CLI runners call), verifies the
 `save()` / `load()` / `predict_proba()` contract, and stops there. It never reads the validation
 or test labels, so it computes no metrics.
 

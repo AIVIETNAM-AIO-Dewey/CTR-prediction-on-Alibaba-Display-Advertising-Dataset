@@ -3,9 +3,9 @@ Shared Fitting Logic for the Tree-Based CTR Models.
 
 Turns one model YAML configuration into a fitted, persisted artifact (Task 3). Computes no
 metrics: evaluation is Task 4 (src/evaluate/) and tuning is Task 5 (experiments/tune_optuna.py).
-One config == one model, so a run never starts the other model as a side effect.
+One config == one model, so a run never starts another model as a side effect.
 
-Backs the CLI entry points (src.models.run_catboost, src.models.run_xgboost) and notebooks:
+Backs the CLI entry points (run_catboost, run_xgboost, run_random_forest) and notebooks:
 
     from src.models.train import fit_from_config
     run = fit_from_config("configs/catboost.yaml", sample_size=200_000)
@@ -30,6 +30,7 @@ import yaml
 from src.models.base_model import BaseCTRModel
 from src.models.catboost_model import CatBoostCTRModel
 from src.models.data_utils import CTRDataset, load_ctr_dataset
+from src.models.random_forest_model import RandomForestCTRModel
 from src.models.xgboost_model import XGBoostCTRModel
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class ModelSpec:
 MODEL_REGISTRY: Dict[str, ModelSpec] = {
     "catboost": ModelSpec(CatBoostCTRModel, "configs/catboost.yaml"),
     "xgboost": ModelSpec(XGBoostCTRModel, "configs/xgboost.yaml"),
+    "random_forest": ModelSpec(RandomForestCTRModel, "configs/random_forest.yaml"),
 }
 
 
@@ -255,8 +257,13 @@ def fit_from_config(
         **_build_kwargs(model_cls, params, seed),
     )
 
-    fit_kwargs: Dict[str, Any] = {"early_stopping_rounds": early_stopping_rounds}
-    if "verbose_eval" in inspect.signature(model.fit).parameters:
+    # Forward only the fit-time arguments this wrapper declares: a forest has neither early
+    # stopping nor per-round logging, so passing them through would reach sklearn and fail.
+    fit_params = inspect.signature(model.fit).parameters
+    fit_kwargs: Dict[str, Any] = {}
+    if "early_stopping_rounds" in fit_params:
+        fit_kwargs["early_stopping_rounds"] = early_stopping_rounds
+    if "verbose_eval" in fit_params:
         fit_kwargs["verbose_eval"] = verbose_eval
 
     start = time.time()
@@ -296,7 +303,7 @@ def fit_from_config(
         "categorical_features": list(dataset.categorical_features),
         "numeric_features": list(dataset.numeric_features),
         "dropped_features": list(config.get("features", {}).get("drop_features") or []),
-        "early_stopping_rounds": early_stopping_rounds,
+        "early_stopping_rounds": fit_kwargs.get("early_stopping_rounds"),
         "best_iteration": int(getattr(model, "best_iteration_", 0) or 0),
         "train_seconds": round(elapsed, 2),
         "params": params,
