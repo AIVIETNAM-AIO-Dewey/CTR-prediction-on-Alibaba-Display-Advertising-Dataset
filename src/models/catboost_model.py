@@ -15,15 +15,13 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from src.models.base_model import BaseCTRModel
-
 logger = logging.getLogger(__name__)
 
 # Placeholder used for null categorical levels (CatBoost rejects NaN in cat features)
 _CAT_NULL_TOKEN = "__NA__"
 
 
-class CatBoostCTRModel(BaseCTRModel):
+class CatBoostCTRModel:
     """
     CatBoost Model Wrapper for Click-Through Rate (CTR) Prediction.
 
@@ -84,7 +82,12 @@ class CatBoostCTRModel(BaseCTRModel):
             verbose: Logging interval for boosting rounds (0 to silence).
             config: Additional hyperparameter dictionary overriding defaults.
         """
-        super().__init__(model_name="CatBoost", config=config)
+        self.model_name = "CatBoost"
+        self.config = config or {}
+        self.categorical_features = list(categorical_features or [])
+        self.numeric_features: List[str] = []
+        self.feature_names: List[str] = []
+        self.is_fitted: bool = False
 
         self.loss_function = loss_function
         self.eval_metric = eval_metric
@@ -197,17 +200,22 @@ class CatBoostCTRModel(BaseCTRModel):
         Returns:
             self: The fitted model.
         """
-        if isinstance(y_train, pl.Series):
+        if isinstance(y_train, (pl.Series, pd.Series)):
             y_train = y_train.to_numpy()
-        if isinstance(y_val, pl.Series):
+        elif hasattr(y_train, "to_numpy"):
+            y_train = y_train.to_numpy()
+
+        if isinstance(y_val, (pl.Series, pd.Series)):
+            y_val = y_val.to_numpy()
+        elif hasattr(y_val, "to_numpy"):
             y_val = y_val.to_numpy()
 
-        if isinstance(X_train, pl.DataFrame):
+        if isinstance(X_train, (pl.DataFrame, pd.DataFrame)):
             self.feature_names = list(X_train.columns)
         elif isinstance(X_train, np.ndarray):
             self.feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
         else:
-            raise TypeError("X_train must be a Polars DataFrame or numpy ndarray.")
+            raise TypeError("X_train must be a Polars DataFrame, pandas DataFrame, or numpy ndarray.")
 
         self.active_cat_features_ = [
             c for c in (self.categorical_features or []) if c in self.feature_names
@@ -291,6 +299,50 @@ class CatBoostCTRModel(BaseCTRModel):
 
         pool = self._make_pool(X)
         return self.estimator.predict_proba(pool)[:, 1]
+
+    def predict(
+        self,
+        X: Union[pl.DataFrame, np.ndarray, pd.DataFrame],
+        threshold: float = 0.5,
+    ) -> np.ndarray:
+        """
+        Generate binary CTR predictions at the specified decision threshold.
+
+        Args:
+            X: Feature matrix.
+            threshold: Probability threshold for positive classification (default 0.5).
+
+        Returns:
+            np.ndarray: Binary predictions (0 or 1) of shape (n_samples,).
+        """
+        proba = self.predict_proba(X)
+        return (proba >= threshold).astype(np.int8)
+
+    def evaluate(
+        self,
+        X: Union[pl.DataFrame, np.ndarray, pd.DataFrame],
+        y: Union[pl.Series, np.ndarray, pd.Series],
+        dataset_name: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Compute ROC-AUC, LogLoss, PR-AUC, and Brier Score metrics."""
+        from sklearn.metrics import (
+            average_precision_score,
+            brier_score_loss,
+            log_loss,
+            roc_auc_score,
+        )
+
+        y_true = y.to_numpy() if isinstance(y, (pl.Series, pd.Series)) else np.asarray(y).ravel()
+        y_prob = self.predict_proba(X)
+
+        prefix = f"{dataset_name.lower()}_" if dataset_name else ""
+        has_two_classes = len(np.unique(y_true)) > 1
+        return {
+            f"{prefix}roc_auc": float(roc_auc_score(y_true, y_prob)) if has_two_classes else 0.5,
+            f"{prefix}log_loss": float(log_loss(y_true, y_prob, labels=[0, 1])),
+            f"{prefix}pr_auc": float(average_precision_score(y_true, y_prob)) if has_two_classes else float(np.mean(y_true)),
+            f"{prefix}brier_score": float(brier_score_loss(y_true, y_prob)),
+        }
 
     # ------------------------------------------------------------------ #
     # Diagnostics & Persistence
