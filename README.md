@@ -20,7 +20,9 @@ CTR estimation is a fundamental component of online advertising, sponsored searc
 CTR_Prediction/
 │
 ├── configs/
-│   └── preprocessing.yaml              # Preprocessing configurations, paths, schema types, and split dates
+│   ├── preprocessing.yaml              # Preprocessing configurations, paths, schema types, and split dates
+│   ├── feature_engineering.yaml        # Feature engineering and target encoding configuration
+│   └── tree_models.yaml                # Feature scoping and CatBoost / XGBoost hyperparameters
 │
 ├── data/
 │   ├── raw/                            # Input raw CSV files (ignored by Git)
@@ -93,18 +95,22 @@ CTR_Prediction/
    - Cross features: `gender_x_cate` (`final_gender_code` x `cate_id`) and `pid_x_cate` (`pid` x `cate_id`).
    - Out-of-fold smoothed Bayesian target encoding for high-cardinality IDs (`cate_id`, `brand`, `customer`, `pid`), fitted exclusively on train and frozen onto val/test to prevent leakage.
 
+5. Tree-Based Model Suite (`src/models/`):
+   - `BaseCTRModel` abstract interface standardizing `fit()`, `predict_proba()`, `predict()`, `evaluate()`, `save()`, and `load()`.
+   - Benchmark metrics on every partition: ROC-AUC, LogLoss, PR-AUC (Average Precision), and Brier score.
+   - CatBoost wrapper: ordered boosting with native high-cardinality categorical handling via target statistics and automatic feature combinations.
+   - XGBoost wrapper: histogram trees with native categorical splits (`enable_categorical`), using category dictionaries fitted on train only and frozen onto val/test.
+   - Feature scoping driven by `configs/tree_models.yaml`, dropping `nonclk`, `user`, `adgroup_id`, `time_stamp`, and the collinear `cms_segid` per the Feature Decision Matrix.
+
 ### Upcoming Phases
-5. Feature Selection:
+6. Feature Selection:
    - Automated feature selection module based on Mutual Information and LightGBM Gain.
 
-6. Multi-Model Machine Learning Experiments:
-   - Development of standardized wrappers for 4 tree-based algorithms:
-     - LightGBM: Fast histogram-based gradient boosting with native categorical handling.
-     - CatBoost: Ordered boosting with robust handling of categorical combinations.
-     - XGBoost: Exact and histogram-based gradient boosted trees.
-     - RandomForest: Bagging benchmark on stratified subsets.
+7. Remaining Model Experiments:
+   - LightGBM: Fast histogram-based gradient boosting with native categorical handling.
+   - RandomForest: Bagging benchmark on stratified subsets.
 
-7. Hyperparameter Tuning, Explainability, and Ensembling:
+8. Hyperparameter Tuning, Explainability, and Ensembling:
    - Automated hyperparameter optimization using Optuna.
    - Global and local feature interpretability using SHAP.
    - Ensembling / Stacking of top-performing models for final test submission.
@@ -149,6 +155,27 @@ Reads `train.parquet` / `val.parquet` / `test.parquet` from `data/processed/` an
 python -m src.features.run_feature_engineering --config configs/feature_engineering.yaml
 ```
 
-## 5. Team Contribution Guidelines
+### 5. Training the Tree Models (CatBoost & XGBoost)
+Reads `train_fe.parquet` / `val_fe.parquet` / `test_fe.parquet`, trains with early stopping on the
+validation partition, writes artifacts to `models/` and a metric summary to
+`experiments/tree_models_results.json`:
+
+```bash
+# Smoke run: both models on a 100,000-row training sample
+python -m src.models.run_tree_models --use-fe --sample-size 100000
+
+# Full engineered dataset, both models
+python -m src.models.run_tree_models --use-fe --sample-size 0
+
+# Single model on a 5% sample
+python -m src.models.run_tree_models --use-fe --sample-fraction 0.05 --model catboost
+python -m src.models.run_tree_models --use-fe --sample-fraction 0.05 --model xgboost
+```
+
+Hyperparameters, the feature scope, and the categorical / numeric split live in
+`configs/tree_models.yaml`. Set `catboost.task_type: GPU` and `xgboost.device: cuda` there to train
+on a CUDA device.
+
+## 6. Team Contribution Guidelines
 
 Refer to CONTRIBUTING.md for task assignments, code style rules, branch conventions, and submission workflows.
