@@ -21,38 +21,6 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
-def _resolve_parquet_paths(
-    processed_dir: Union[str, Path] = "data/processed",
-    use_fe: bool = True,
-) -> Tuple[Path, Optional[Path]]:
-    """
-    Locate train and validation parquet files locally or across Kaggle input directories.
-    """
-    proc_path = Path(processed_dir)
-    train_file = "train_fe.parquet" if use_fe else "train.parquet"
-    val_file = "val_fe.parquet" if use_fe else "val.parquet"
-
-    # 1. Local path
-    cand_train = proc_path / train_file
-    cand_val = proc_path / val_file
-    if cand_train.exists():
-        return cand_train, cand_val if cand_val.exists() else None
-
-    # 2. Relative from notebook directory
-    alt_train = Path("..") / proc_path / train_file
-    alt_val = Path("..") / proc_path / val_file
-    if alt_train.exists():
-        return alt_train, alt_val if alt_val.exists() else None
-
-    # 3. Kaggle input directory auto-discovery
-    kaggle_base = Path("/kaggle/input")
-    if kaggle_base.exists():
-        for sub in kaggle_base.rglob(train_file):
-            if sub.is_file():
-                v_path = sub.parent / val_file
-                return sub, v_path if v_path.exists() else None
-
-    return cand_train, cand_val
 
 
 class LogisticRegressionModel:
@@ -127,56 +95,16 @@ class LogisticRegressionModel:
         else:
             cfg = dict(config_path_or_dict)
 
-        paths = cfg.get("paths", {})
-        data_cfg = cfg.get("data", {})
-        features_cfg = cfg.get("features", {})
+        from src.models.train import load_dataset_from_config
 
-        fe_flag = data_cfg.get("use_fe", True) if use_fe is None else use_fe
-        target_dir = data_dir or paths.get("processed_dir", "data/processed")
-
-        train_path, val_path = _resolve_parquet_paths(target_dir, use_fe=fe_flag)
-
-        if not train_path.exists():
-            raise FileNotFoundError(
-                f"Training parquet not found at: {train_path}. "
-                f"Please ensure data is in {target_dir} or in /kaggle/input/."
-            )
-
-        logger.info(f"[{cls.__name__}] Reading parquet from: {train_path.parent} ({train_path.name})")
-        df_train = pl.read_parquet(train_path)
-        df_val = pl.read_parquet(val_path) if val_path and val_path.exists() else None
-
-        seed = data_cfg.get("random_seed", 42)
-        n_rows = sample_size if sample_size is not None else data_cfg.get("sample_size")
-        frac = sample_fraction if sample_fraction is not None else data_cfg.get("sample_fraction")
-
-        if n_rows and 0 < n_rows < len(df_train):
-            logger.info(f"[{cls.__name__}] Sampling train to {n_rows:,} rows...")
-            df_train = df_train.sample(n=n_rows, seed=seed)
-            if df_val is not None:
-                df_val = df_val.sample(n=min(int(n_rows * 0.2), len(df_val)), seed=seed)
-        elif frac and 0.0 < frac < 1.0:
-            logger.info(f"[{cls.__name__}] Sampling fraction {frac:.2%}...")
-            df_train = df_train.sample(fraction=frac, seed=seed)
-            if df_val is not None:
-                df_val = df_val.sample(fraction=frac, seed=seed)
-
-        target_col = features_cfg.get("target", "clk")
-        exclude = set(features_cfg.get("exclude_cols", []))
-        drop = set(features_cfg.get("drop_features", []))
-
-        feat_cols = [
-            c for c in df_train.columns
-            if c not in exclude and c not in drop and c != target_col
-        ]
-
-        X_train = df_train.select(feat_cols)
-        y_train = df_train[target_col]
-
-        X_val = df_val.select(feat_cols) if df_val is not None else None
-        y_val = df_val[target_col] if df_val is not None else None
-
-        return X_train, y_train, X_val, y_val
+        dataset = load_dataset_from_config(
+            config=cfg,
+            processed_dir=data_dir,
+            use_fe=use_fe,
+            sample_size=sample_size,
+            sample_fraction=sample_fraction,
+        )
+        return dataset.X_train, dataset.y_train, dataset.X_val, dataset.y_val
 
     @classmethod
     def from_config(
