@@ -1,0 +1,109 @@
+# ==============================================================================
+# CTR Prediction - XGBoost Training Configuration
+# ==============================================================================
+# Fit-only (Task 3). Evaluation is Task 4, tuning is Task 5.
+#   python -m src.models.run_xgboost --sample-size 100000
+# ==============================================================================
+
+model: xgboost
+
+paths:
+  processed_dir: "data/processed"
+  models_dir: "models"
+  model_basename: "xgboost"                            # Suffixed _fe when data.use_fe is true
+  manifest_output: "experiments/xgboost_run.json"      # Training manifest, no metrics
+
+# Sampling controls (CLI flags override these)
+data:
+  use_fe: true                   # Train on train_fe.parquet / val_fe.parquet / test_fe.parquet
+  sample_size: 100000            # 0 or null -> full dataset
+  sample_fraction: null          # Alternative to sample_size, e.g. 0.05
+  random_seed: 42
+
+# Features Configuration
+features:
+  target: "clk"
+
+  # Per the Feature Decision Matrix (notebook/feature_analysis.ipynb): nonclk leaks the label,
+  # the ID/time keys are consumed by feature engineering only, cms_segid collides with cms_group_id.
+  exclude_cols:
+    - "clk"
+    - "nonclk"
+    - "datetime"
+    - "date"
+    - "time_stamp"
+    - "user"
+    - "userid"
+    - "user_id"
+    - "adgroup_id"
+    - "cms_segid"
+
+  categorical:
+    - "pid"
+    - "final_gender_code"
+    - "age_level"
+    - "pvalue_level"
+    - "shopping_level"
+    - "occupation"
+    - "new_user_class_level"
+    - "cms_group_id"
+    - "cate_id"
+    - "brand"
+    - "customer"
+    - "campaign_id"
+    - "is_weekend"
+    - "day_of_week"
+    - "hour"
+    - "gender_x_cate"
+    - "pid_x_cate"
+
+  numeric:
+    - "price"
+    - "user_adgroup_exposure_seq"
+    - "user_cate_exposure_seq"
+    - "price_log"
+    - "price_ratio_cate"
+    - "hour_sin"
+    - "hour_cos"
+    - "dow_sin"
+    - "dow_cos"
+    - "cate_id_te"
+    - "brand_te"
+    - "customer_te"
+    - "pid_te"
+
+  # Splitting on raw categorical levels let XGBoost memorize advertiser IDs: customer (255K
+  # levels), brand (100K) and campaign_id (423K) took 41% of total gain, stopping at iter 52/2000.
+  # customer/brand are dropped in favour of their target encodings; campaign_id has none yet, so
+  # dropping it would remove the signal rather than regularize it.
+  drop_features:
+    - "customer"
+    - "brand"
+
+# XGBoost Hyperparameters
+params:
+  objective: "binary:logistic"
+  eval_metric:                   # Early stopping tracks the LAST entry -> logloss
+    - "auc"
+    - "logloss"
+  tree_method: "hist"
+  n_estimators: 2000
+  learning_rate: 0.05
+  max_depth: 8
+  min_child_weight: 50.0         # Raised from 10: train-AUC 0.696 vs val-AUC 0.595 at 5M rows
+  gamma: 0.0
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  scale_pos_weight: 1.0
+  max_bin: 256
+  max_cat_to_onehot: 8
+  max_cat_threshold: 16          # Lowered from 64 to limit categorical memorization
+  grow_policy: "depthwise"
+  early_stopping_rounds: 100
+  device: "cpu"                  # 'cuda' when a CUDA device is available
+  n_jobs: -1
+  random_state: 42
+  verbosity: 1
+  verbose_eval: 50

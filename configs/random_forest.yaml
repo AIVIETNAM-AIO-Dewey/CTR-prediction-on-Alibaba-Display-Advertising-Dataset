@@ -1,0 +1,99 @@
+# ==============================================================================
+# CTR Prediction - Random Forest Training Configuration
+# ==============================================================================
+# Fit-only (Task 3). Bagging baseline the boosted models are compared against.
+# Evaluation is Task 4, tuning is Task 5.
+#   python -m src.models.run_random_forest --sample-size 100000
+# ==============================================================================
+
+model: random_forest
+
+paths:
+  processed_dir: "data/processed"
+  models_dir: "models"
+  model_basename: "random_forest"                      # Suffixed _fe when data.use_fe is true
+  manifest_output: "experiments/random_forest_run.json"  # Training manifest, no metrics
+
+# Sampling controls (CLI flags override these)
+data:
+  use_fe: true
+  sample_size: 100000            # 0 or null -> full dataset
+  sample_fraction: null
+  random_seed: 42
+
+features:
+  target: "clk"
+
+  # Per the Feature Decision Matrix (notebook/feature_analysis.ipynb): nonclk leaks the label,
+  # the ID/time keys are consumed by feature engineering only, cms_segid collides with cms_group_id.
+  exclude_cols:
+    - "clk"
+    - "nonclk"
+    - "datetime"
+    - "date"
+    - "time_stamp"
+    - "user"
+    - "userid"
+    - "user_id"
+    - "adgroup_id"
+    - "cms_segid"
+
+  categorical:
+    - "pid"
+    - "final_gender_code"
+    - "age_level"
+    - "pvalue_level"
+    - "shopping_level"
+    - "occupation"
+    - "new_user_class_level"
+    - "cms_group_id"
+    - "cate_id"
+    - "brand"
+    - "customer"
+    - "campaign_id"
+    - "is_weekend"
+    - "day_of_week"
+    - "hour"
+    - "gender_x_cate"
+    - "pid_x_cate"
+
+  numeric:
+    - "price"
+    - "user_adgroup_exposure_seq"
+    - "user_cate_exposure_seq"
+    - "price_log"
+    - "price_ratio_cate"
+    - "hour_sin"
+    - "hour_cos"
+    - "dow_sin"
+    - "dow_cos"
+    - "cate_id_te"
+    - "brand_te"
+    - "customer_te"
+    - "pid_te"
+
+  # Scikit-learn has no native categorical handling, so categoricals are ordinal-encoded, and an
+  # ordinal code carries no usable order once the cardinality is large: campaign_id (395K levels),
+  # customer (242K) and brand (96K) are dropped in favour of their target encodings. The rest stay
+  # (gender_x_cate 17K, pid_x_cate 12K, cate_id 6.6K) so the baseline keeps its interaction signal.
+  drop_features:
+    - "customer"
+    - "brand"
+    - "campaign_id"
+
+# Random Forest Hyperparameters
+params:
+  n_estimators: 300
+  criterion: "gini"
+  max_depth: 16                  # Unbounded depth memorizes on 20M rows and explodes artifact size
+  min_samples_split: 20
+  min_samples_leaf: 50           # Main guard on leaf-frequency noise; mirrors XGBoost min_child_weight
+  max_features: "sqrt"
+  max_samples: 0.8               # Rows drawn per tree (bootstrap must be true)
+  bootstrap: true
+  oob_score: false               # sklearn scores OOB by accuracy, which at a 5% base rate just
+                                 # rewards predicting all-zero; leave measurement to Task 4
+  class_weight: null             # null preserves probability calibration
+  n_jobs: -1
+  random_state: 42
+  verbose: 0
