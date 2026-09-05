@@ -73,9 +73,10 @@ features:
     - "pid_te"
 
   # Scikit-learn has no native categorical handling, so categoricals are ordinal-encoded, and an
-  # ordinal code carries no usable order once the cardinality is large: campaign_id (395K levels),
-  # customer (242K) and brand (96K) are dropped in favour of their target encodings. The rest stay
-  # (gender_x_cate 17K, pid_x_cate 12K, cate_id 6.6K) so the baseline keeps its interaction signal.
+  # ordinal code carries no usable order once the cardinality is large. campaign_id (395K levels),
+  # customer (242K) and brand (96K) are therefore dropped. campaign_id_te is not available yet;
+  # campaign_id is intentionally removed rather than silently claiming a target-encoding fallback.
+  # The remaining categoricals (gender_x_cate, pid_x_cate, cate_id) keep interaction signal.
   drop_features:
     - "customer"
     - "brand"

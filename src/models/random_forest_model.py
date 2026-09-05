@@ -10,10 +10,9 @@ import logging
 
 import joblib
 import numpy as np
+import pandas as pd
 import polars as pl
 from sklearn.ensemble import RandomForestClassifier
-
-from src.models.base_model import BaseCTRModel
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 _UNSEEN_CODE = -1
 
 
-class RandomForestCTRModel(BaseCTRModel):
+class RandomForestCTRModel:
     """
     Random Forest Model Wrapper for Click-Through Rate (CTR) Prediction.
 
@@ -79,7 +78,12 @@ class RandomForestCTRModel(BaseCTRModel):
             verbose: Verbosity level passed to scikit-learn.
             config: Additional hyperparameter dictionary overriding defaults.
         """
-        super().__init__(model_name="RandomForest", config=config)
+        self.model_name = "RandomForest"
+        self.config = config or {}
+        self.categorical_features = list(categorical_features or [])
+        self.numeric_features: List[str] = []
+        self.feature_names: List[str] = []
+        self.is_fitted = False
 
         self.n_estimators = n_estimators
         self.criterion = criterion
@@ -91,7 +95,6 @@ class RandomForestCTRModel(BaseCTRModel):
         self.bootstrap = bootstrap
         self.oob_score = oob_score
         self.class_weight = class_weight
-        self.categorical_features = categorical_features
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -100,19 +103,41 @@ class RandomForestCTRModel(BaseCTRModel):
         self.best_iteration_: Optional[int] = None
         self.active_cat_features_: List[str] = []
         self.category_maps_: Dict[str, Dict[str, int]] = {}
+        self.numeric_medians_: Dict[str, float] = {}
         self.oob_score_: Optional[float] = None
 
     # ------------------------------------------------------------------ #
     # Data Preparation
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _to_polars(df: Union[pl.DataFrame, np.ndarray], schema: List[str]) -> pl.DataFrame:
+    def _to_polars(
+        df: Union[pl.DataFrame, pd.DataFrame, np.ndarray], schema: List[str]
+    ) -> pl.DataFrame:
         """Normalize any supported input container into a Polars DataFrame."""
         if isinstance(df, pl.DataFrame):
             return df
+        if isinstance(df, pd.DataFrame):
+            return pl.from_pandas(df)
         if isinstance(df, np.ndarray):
             return pl.DataFrame(df, schema=schema)
-        raise TypeError("Expected Polars DataFrame or numpy ndarray.")
+        raise TypeError("Expected Polars DataFrame, pandas DataFrame, or numpy ndarray.")
+
+    @staticmethod
+    def _string_columns(df: Union[pl.DataFrame, pd.DataFrame]) -> List[str]:
+        """Return string-like columns that must use the fitted category map."""
+        if isinstance(df, pd.DataFrame):
+            return [
+                col
+                for col in df.columns
+                if (
+                    pd.api.types.is_object_dtype(df[col])
+                    or pd.api.types.is_string_dtype(df[col])
+                    or isinstance(df[col].dtype, pd.CategoricalDtype)
+                )
+            ]
+
+        string_dtypes = {pl.Utf8, pl.String, pl.Categorical, pl.Enum, pl.Object}
+        return [col for col, dtype in df.schema.items() if dtype in string_dtypes]
 
     def _fit_category_maps(self, X: pl.DataFrame) -> None:
         """Freeze a level -> integer code dictionary per categorical column, from train only."""
@@ -120,6 +145,17 @@ class RandomForestCTRModel(BaseCTRModel):
         for col in self.active_cat_features_:
             levels = X.get_column(col).cast(pl.Utf8).unique().drop_nulls().sort().to_list()
             self.category_maps_[col] = {level: code for code, level in enumerate(levels)}
+
+    def _fit_numeric_medians(self, X: pl.DataFrame) -> None:
+        """Fit numeric imputation values on train only for sklearn 1.3 compatibility."""
+        self.numeric_medians_ = {}
+        for col in self.feature_names:
+            if col in self.active_cat_features_:
+                continue
+            values = X.get_column(col).cast(pl.Float64, strict=False)
+            median = values.median()
+            median_value = float(median) if median is not None and np.isfinite(median) else 0.0
+            self.numeric_medians_[col] = median_value
 
     def _prepare_matrix(self, df: Union[pl.DataFrame, np.ndarray]) -> np.ndarray:
         """
@@ -153,7 +189,14 @@ class RandomForestCTRModel(BaseCTRModel):
                     .alias(col)
                 )
             else:
-                exprs.append(pl.col(col).cast(pl.Float32, strict=False).alias(col))
+                median = self.numeric_medians_.get(col, 0.0)
+                exprs.append(
+                    pl.col(col)
+                    .cast(pl.Float32, strict=False)
+                    .fill_nan(median)
+                    .fill_null(median)
+                    .alias(col)
+                )
 
         return X.with_columns(exprs).to_numpy().astype(np.float32, copy=False)
 
@@ -185,19 +228,27 @@ class RandomForestCTRModel(BaseCTRModel):
         Returns:
             self: The fitted model.
         """
-        if isinstance(y_train, pl.Series):
-            y_train = y_train.to_numpy()
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must either both be provided or both be omitted.")
 
-        if isinstance(X_train, pl.DataFrame):
+        if isinstance(y_train, (pl.Series, pd.Series)):
+            y_train = y_train.to_numpy()
+        y_train = np.asarray(y_train).ravel()
+
+        if isinstance(X_train, (pl.DataFrame, pd.DataFrame)):
             self.feature_names = list(X_train.columns)
         elif isinstance(X_train, np.ndarray):
             self.feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
         else:
-            raise TypeError("X_train must be a Polars DataFrame or numpy ndarray.")
+            raise TypeError(
+                "X_train must be a Polars DataFrame, pandas DataFrame, or numpy ndarray."
+            )
 
-        self.active_cat_features_ = [
-            c for c in (self.categorical_features or []) if c in self.feature_names
-        ]
+        configured_cats = [c for c in self.categorical_features if c in self.feature_names]
+        detected_cats = []
+        if isinstance(X_train, (pl.DataFrame, pd.DataFrame)):
+            detected_cats = [c for c in self._string_columns(X_train) if c in self.feature_names]
+        self.active_cat_features_ = list(dict.fromkeys(configured_cats + detected_cats))
 
         if X_val is not None:
             logger.info("Random Forest has no early stopping; the validation partition is unused.")
@@ -205,6 +256,7 @@ class RandomForestCTRModel(BaseCTRModel):
         # Dictionaries come from train only, then stay frozen for val/test.
         X_train_pl = self._to_polars(X_train, self.feature_names)
         self._fit_category_maps(X_train_pl)
+        self._fit_numeric_medians(X_train_pl)
         X_train_np = self._prepare_matrix(X_train_pl)
 
         self.estimator = RandomForestClassifier(
@@ -232,7 +284,7 @@ class RandomForestCTRModel(BaseCTRModel):
         self.estimator.fit(X_train_np, y_train, **kwargs)
 
         self.is_fitted = True
-        self.best_iteration_ = self.n_estimators   # No early stopping: every tree is kept
+        self.best_iteration_ = max(self.n_estimators - 1, 0)  # No early stopping: every tree is kept
         self.oob_score_ = float(getattr(self.estimator, "oob_score_", np.nan))
 
         logger.info(
@@ -261,7 +313,19 @@ class RandomForestCTRModel(BaseCTRModel):
         if not self.is_fitted or self.estimator is None:
             raise RuntimeError("Model is not fitted. Call .fit() before predicting.")
 
-        return self.estimator.predict_proba(self._prepare_matrix(X))[:, 1]
+        probabilities = self.estimator.predict_proba(self._prepare_matrix(X))
+        class_one = np.flatnonzero(np.asarray(self.estimator.classes_) == 1)
+        if len(class_one) != 1:
+            raise RuntimeError("Random Forest estimator has no binary positive class labelled 1.")
+        return probabilities[:, int(class_one[0])]
+
+    def predict(
+        self,
+        X: Union[pl.DataFrame, pd.DataFrame, np.ndarray],
+        threshold: float = 0.5,
+    ) -> np.ndarray:
+        """Return binary predictions using a configurable probability threshold."""
+        return (self.predict_proba(X) >= threshold).astype(np.int8)
 
     # ------------------------------------------------------------------ #
     # Diagnostics & Persistence
@@ -284,6 +348,9 @@ class RandomForestCTRModel(BaseCTRModel):
         if not self.is_fitted or self.estimator is None:
             raise RuntimeError("Model is not fitted.")
 
+        if importance_type.lower() != "gini":
+            raise ValueError("Random Forest supports only importance_type='gini'.")
+
         raw_importance = np.asarray(self.estimator.feature_importances_, dtype=np.float64)
         total = float(np.sum(raw_importance)) if np.sum(raw_importance) > 0 else 1.0
 
@@ -304,6 +371,9 @@ class RandomForestCTRModel(BaseCTRModel):
         Args:
             filepath: Destination file path.
         """
+        if not self.is_fitted or self.estimator is None:
+            raise RuntimeError("Cannot save an unfitted model.")
+
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -315,6 +385,7 @@ class RandomForestCTRModel(BaseCTRModel):
             "categorical_features": self.categorical_features,
             "active_cat_features": self.active_cat_features_,
             "category_maps": self.category_maps_,
+            "numeric_medians": self.numeric_medians_,
             "oob_score": self.oob_score_,
             "is_fitted": self.is_fitted,
         }
@@ -346,6 +417,7 @@ class RandomForestCTRModel(BaseCTRModel):
         instance.feature_names = payload.get("feature_names", [])
         instance.active_cat_features_ = payload.get("active_cat_features", [])
         instance.category_maps_ = payload.get("category_maps", {})
+        instance.numeric_medians_ = payload.get("numeric_medians", {})
         instance.oob_score_ = payload.get("oob_score")
         instance.is_fitted = payload.get("is_fitted", False)
         logger.info(f"Loaded Random Forest model from {path}")
