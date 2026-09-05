@@ -15,15 +15,13 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from src.models.base_model import BaseCTRModel
-
 logger = logging.getLogger(__name__)
 
 # Placeholder used for null categorical levels (CatBoost rejects NaN in cat features)
 _CAT_NULL_TOKEN = "__NA__"
 
 
-class CatBoostCTRModel(BaseCTRModel):
+class CatBoostCTRModel:
     """
     CatBoost Model Wrapper for Click-Through Rate (CTR) Prediction.
 
@@ -84,7 +82,12 @@ class CatBoostCTRModel(BaseCTRModel):
             verbose: Logging interval for boosting rounds (0 to silence).
             config: Additional hyperparameter dictionary overriding defaults.
         """
-        super().__init__(model_name="CatBoost", config=config)
+        self.model_name = "CatBoost"
+        self.config = config or {}
+        self.categorical_features = list(categorical_features or [])
+        self.numeric_features: List[str] = []
+        self.feature_names: List[str] = []
+        self.is_fitted = False
 
         self.loss_function = loss_function
         self.eval_metric = eval_metric
@@ -100,7 +103,6 @@ class CatBoostCTRModel(BaseCTRModel):
         self.rsm = rsm
         self.scale_pos_weight = scale_pos_weight
         self.boosting_type = boosting_type
-        self.categorical_features = categorical_features
         self.random_state = random_state
         self.thread_count = thread_count
         self.task_type = task_type
@@ -113,6 +115,23 @@ class CatBoostCTRModel(BaseCTRModel):
     # ------------------------------------------------------------------ #
     # Data Preparation
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _string_columns(df: Union[pl.DataFrame, pd.DataFrame]) -> List[str]:
+        """Return string-like columns that must be passed to CatBoost as categoricals."""
+        if isinstance(df, pd.DataFrame):
+            return [
+                col
+                for col in df.columns
+                if (
+                    pd.api.types.is_object_dtype(df[col])
+                    or pd.api.types.is_string_dtype(df[col])
+                    or isinstance(df[col].dtype, pd.CategoricalDtype)
+                )
+            ]
+
+        string_dtypes = {pl.Utf8, pl.String, pl.Categorical, pl.Enum, pl.Object}
+        return [col for col, dtype in df.schema.items() if dtype in string_dtypes]
+
     def _prepare_dataframe(
         self,
         df: Union[pl.DataFrame, np.ndarray, pd.DataFrame],
@@ -152,9 +171,9 @@ class CatBoostCTRModel(BaseCTRModel):
             else:
                 dtype = df.schema.get(col)
                 if dtype in (pl.Utf8, pl.String, pl.Categorical, pl.Enum, pl.Object):
-                    # Unexpected string column outside the declared categorical list
-                    exprs.append(
-                        pl.col(col).cast(pl.Utf8).fill_null(_CAT_NULL_TOKEN).alias(col)
+                    raise ValueError(
+                        f"String feature '{col}' is not declared as categorical. "
+                        "Add it to categorical_features."
                     )
                 else:
                     exprs.append(pl.col(col).cast(pl.Float32).alias(col))
@@ -197,21 +216,31 @@ class CatBoostCTRModel(BaseCTRModel):
         Returns:
             self: The fitted model.
         """
-        if isinstance(y_train, pl.Series):
-            y_train = y_train.to_numpy()
-        if isinstance(y_val, pl.Series):
-            y_val = y_val.to_numpy()
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must either both be provided or both be omitted.")
 
-        if isinstance(X_train, pl.DataFrame):
+        if isinstance(y_train, (pl.Series, pd.Series)):
+            y_train = y_train.to_numpy()
+        if isinstance(y_val, (pl.Series, pd.Series)):
+            y_val = y_val.to_numpy()
+        y_train = np.asarray(y_train).ravel()
+        if y_val is not None:
+            y_val = np.asarray(y_val).ravel()
+
+        if isinstance(X_train, (pl.DataFrame, pd.DataFrame)):
             self.feature_names = list(X_train.columns)
         elif isinstance(X_train, np.ndarray):
             self.feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
         else:
-            raise TypeError("X_train must be a Polars DataFrame or numpy ndarray.")
+            raise TypeError(
+                "X_train must be a Polars DataFrame, pandas DataFrame, or numpy ndarray."
+            )
 
-        self.active_cat_features_ = [
-            c for c in (self.categorical_features or []) if c in self.feature_names
-        ]
+        configured_cats = [c for c in self.categorical_features if c in self.feature_names]
+        detected_cats = []
+        if isinstance(X_train, (pl.DataFrame, pd.DataFrame)):
+            detected_cats = [c for c in self._string_columns(X_train) if c in self.feature_names]
+        self.active_cat_features_ = list(dict.fromkeys(configured_cats + detected_cats))
 
         train_pool = self._make_pool(X_train, y_train)
 
@@ -292,6 +321,14 @@ class CatBoostCTRModel(BaseCTRModel):
         pool = self._make_pool(X)
         return self.estimator.predict_proba(pool)[:, 1]
 
+    def predict(
+        self,
+        X: Union[pl.DataFrame, pd.DataFrame, np.ndarray],
+        threshold: float = 0.5,
+    ) -> np.ndarray:
+        """Return binary predictions using a configurable probability threshold."""
+        return (self.predict_proba(X) >= threshold).astype(np.int8)
+
     # ------------------------------------------------------------------ #
     # Diagnostics & Persistence
     # ------------------------------------------------------------------ #
@@ -336,6 +373,9 @@ class CatBoostCTRModel(BaseCTRModel):
         Args:
             filepath: Destination file path.
         """
+        if not self.is_fitted or self.estimator is None:
+            raise RuntimeError("Cannot save an unfitted model.")
+
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {

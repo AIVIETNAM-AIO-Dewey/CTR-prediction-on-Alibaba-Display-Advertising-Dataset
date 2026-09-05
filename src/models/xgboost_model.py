@@ -15,12 +15,10 @@ import pandas as pd
 import polars as pl
 import xgboost as xgb
 
-from src.models.base_model import BaseCTRModel
-
 logger = logging.getLogger(__name__)
 
 
-class XGBoostCTRModel(BaseCTRModel):
+class XGBoostCTRModel:
     """
     XGBoost Model Wrapper for Click-Through Rate (CTR) Prediction.
 
@@ -88,7 +86,12 @@ class XGBoostCTRModel(BaseCTRModel):
             verbosity: Engine verbosity level.
             config: Additional hyperparameter dictionary overriding defaults.
         """
-        super().__init__(model_name="XGBoost", config=config)
+        self.model_name = "XGBoost"
+        self.config = config or {}
+        self.categorical_features = list(categorical_features or [])
+        self.numeric_features: List[str] = []
+        self.feature_names: List[str] = []
+        self.is_fitted = False
 
         self.objective = objective
         self.eval_metric = list(eval_metric) if isinstance(eval_metric, (list, tuple)) else [eval_metric]
@@ -107,7 +110,6 @@ class XGBoostCTRModel(BaseCTRModel):
         self.max_cat_to_onehot = max_cat_to_onehot
         self.max_cat_threshold = max_cat_threshold
         self.grow_policy = grow_policy
-        self.categorical_features = categorical_features
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.device = device
@@ -123,6 +125,23 @@ class XGBoostCTRModel(BaseCTRModel):
     # Data Preparation
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _string_columns(df: Union[pl.DataFrame, pd.DataFrame]) -> List[str]:
+        """Return string-like columns that must use XGBoost categorical support."""
+        if isinstance(df, pd.DataFrame):
+            return [
+                col
+                for col in df.columns
+                if (
+                    pd.api.types.is_object_dtype(df[col])
+                    or pd.api.types.is_string_dtype(df[col])
+                    or isinstance(df[col].dtype, pd.CategoricalDtype)
+                )
+            ]
+
+        string_dtypes = {pl.Utf8, pl.String, pl.Categorical, pl.Enum, pl.Object}
+        return [col for col, dtype in df.schema.items() if dtype in string_dtypes]
+
+    @staticmethod
     def _to_pandas(df: Union[pl.DataFrame, np.ndarray, pd.DataFrame], schema: List[str]) -> pd.DataFrame:
         """Normalize any supported input container into a pandas DataFrame."""
         if isinstance(df, pd.DataFrame):
@@ -137,7 +156,7 @@ class XGBoostCTRModel(BaseCTRModel):
         """Freeze the category dictionary of each categorical column on the train partition."""
         self.category_dtypes_ = {}
         for col in self.active_cat_features_:
-            categories = pd.Index(X_pd[col].dropna().unique())
+            categories = pd.Index(X_pd[col].dropna().astype(str).unique())
             self.category_dtypes_[col] = pd.CategoricalDtype(categories=categories)
 
     def _prepare_dataframe(
@@ -171,9 +190,23 @@ class XGBoostCTRModel(BaseCTRModel):
         for col in X_pd.columns:
             series = X_pd[col]
             if col in self.category_dtypes_:
-                prepared[col] = series.astype(str).astype(self.category_dtypes_[col])
+                # pandas StringDtype preserves nulls as <NA>; casting through Python str would
+                # turn them into the literal category "nan" and hide missing-value routing.
+                values = series.astype("string")
+                known = self.category_dtypes_[col].categories
+                values = values.where(values.isin(known), pd.NA)
+                prepared[col] = values.astype(self.category_dtypes_[col])
             elif col in self.active_cat_features_:
-                prepared[col] = series.astype(str).astype("category")
+                prepared[col] = series.astype("string").astype("category")
+            elif (
+                pd.api.types.is_object_dtype(series)
+                or pd.api.types.is_string_dtype(series)
+                or isinstance(series.dtype, pd.CategoricalDtype)
+            ):
+                raise ValueError(
+                    f"String feature '{col}' is not declared as categorical. "
+                    "Add it to categorical_features."
+                )
             else:
                 prepared[col] = pd.to_numeric(series, errors="coerce").astype(np.float32)
 
@@ -207,25 +240,35 @@ class XGBoostCTRModel(BaseCTRModel):
         Returns:
             self: The fitted model.
         """
-        if isinstance(y_train, pl.Series):
-            y_train = y_train.to_numpy()
-        if isinstance(y_val, pl.Series):
-            y_val = y_val.to_numpy()
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must either both be provided or both be omitted.")
 
-        if isinstance(X_train, pl.DataFrame):
+        if isinstance(y_train, (pl.Series, pd.Series)):
+            y_train = y_train.to_numpy()
+        if isinstance(y_val, (pl.Series, pd.Series)):
+            y_val = y_val.to_numpy()
+        y_train = np.asarray(y_train).ravel()
+        if y_val is not None:
+            y_val = np.asarray(y_val).ravel()
+
+        if isinstance(X_train, (pl.DataFrame, pd.DataFrame)):
             self.feature_names = list(X_train.columns)
         elif isinstance(X_train, np.ndarray):
             self.feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
         else:
-            raise TypeError("X_train must be a Polars DataFrame or numpy ndarray.")
+            raise TypeError(
+                "X_train must be a Polars DataFrame, pandas DataFrame, or numpy ndarray."
+            )
 
-        self.active_cat_features_ = [
-            c for c in (self.categorical_features or []) if c in self.feature_names
-        ]
+        configured_cats = [c for c in self.categorical_features if c in self.feature_names]
+        detected_cats = []
+        if isinstance(X_train, (pl.DataFrame, pd.DataFrame)):
+            detected_cats = [c for c in self._string_columns(X_train) if c in self.feature_names]
+        self.active_cat_features_ = list(dict.fromkeys(configured_cats + detected_cats))
 
         # Fit category dictionaries on train only, then reuse them for val/test
         train_raw = self._to_pandas(X_train, self.feature_names).loc[:, self.feature_names]
-        self._fit_category_dtypes(train_raw.astype({c: str for c in self.active_cat_features_}))
+        self._fit_category_dtypes(train_raw)
         X_train_df = self._prepare_dataframe(train_raw)
 
         eval_set = None
@@ -277,7 +320,8 @@ class XGBoostCTRModel(BaseCTRModel):
         self.is_fitted = True
         self.best_iteration_ = getattr(self.estimator, "best_iteration", None)
         if self.best_iteration_ is None:
-            self.best_iteration_ = self.n_estimators
+            # XGBoost uses zero-based iteration indices; the last tree is n_estimators - 1.
+            self.best_iteration_ = max(self.n_estimators - 1, 0)
         self.evals_result_ = self.estimator.evals_result() if eval_set is not None else {}
 
         logger.info(f"XGBoost training complete. Best iteration: {self.best_iteration_}")
@@ -305,6 +349,14 @@ class XGBoostCTRModel(BaseCTRModel):
 
         X_eval = self._prepare_dataframe(X)
         return self.estimator.predict_proba(X_eval)[:, 1]
+
+    def predict(
+        self,
+        X: Union[pl.DataFrame, pd.DataFrame, np.ndarray],
+        threshold: float = 0.5,
+    ) -> np.ndarray:
+        """Return binary predictions using a configurable probability threshold."""
+        return (self.predict_proba(X) >= threshold).astype(np.int8)
 
     # ------------------------------------------------------------------ #
     # Diagnostics & Persistence
@@ -350,6 +402,9 @@ class XGBoostCTRModel(BaseCTRModel):
         Args:
             filepath: Destination file path.
         """
+        if not self.is_fitted or self.estimator is None:
+            raise RuntimeError("Cannot save an unfitted model.")
+
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
