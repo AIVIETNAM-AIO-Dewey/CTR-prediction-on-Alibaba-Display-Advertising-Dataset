@@ -1,0 +1,93 @@
+# ==============================================================================
+# CTR Prediction - Logistic Regression Training Configuration
+# ==============================================================================
+# Fit-only (Task 3). Evaluation is Task 4, tuning is Task 5.
+#   python -m src.models.run_logistic_regression --sample-size 100000
+# ==============================================================================
+
+model: logistic_regression
+
+paths:
+  processed_dir: "data/processed"
+  models_dir: "models"
+  model_basename: "logistic_regression"                # Suffixed _fe when data.use_fe is true
+  manifest_output: "experiments/logistic_regression_run.json"
+
+# Sampling controls (CLI flags override these)
+data:
+  use_fe: true                   # Train on train_fe.parquet / val_fe.parquet / test_fe.parquet
+  sample_size: 100000            # 0 or null -> full dataset
+  sample_fraction: null          # Alternative to sample_size, e.g. 0.05
+  random_seed: 42
+
+# Features Configuration
+features:
+  target: "clk"
+
+  # Per the Feature Decision Matrix: nonclk leaks the label,
+  # the ID/time keys are consumed by feature engineering only, cms_segid collides with cms_group_id.
+  exclude_cols:
+    - "clk"
+    - "nonclk"
+    - "datetime"
+    - "date"
+    - "time_stamp"
+    - "user"
+    - "userid"
+    - "user_id"
+    - "adgroup_id"
+    - "cms_segid"
+
+  categorical:
+    - "pid"
+    - "final_gender_code"
+    - "age_level"
+    - "pvalue_level"
+    - "shopping_level"
+    - "occupation"
+    - "new_user_class_level"
+    - "cms_group_id"
+    - "cate_id"
+    - "brand"
+    - "customer"
+    - "campaign_id"
+    - "is_weekend"
+    - "day_of_week"
+    - "hour"
+    - "gender_x_cate"
+    - "pid_x_cate"
+
+  numeric:
+    - "price"
+    - "user_adgroup_exposure_seq"
+    - "user_cate_exposure_seq"
+    - "price_log"
+    - "price_ratio_cate"
+    - "hour_sin"
+    - "hour_cos"
+    - "dow_sin"
+    - "dow_cos"
+    - "cate_id_te"
+    - "brand_te"
+    - "customer_te"
+    - "pid_te"
+
+  # High-cardinality IDs would explode one-hot dimensionality; their target encodings
+  # (*_te) represent their signals in continuous space without sparse explosion.
+  drop_features:
+    - "customer"
+    - "brand"
+    - "campaign_id"
+    - "cate_id"
+
+# Logistic Regression Hyperparameters
+params:
+  penalty: "l2"
+  C: 1.0
+  solver: "lbfgs"
+  max_iter: 200
+  use_sgd: false                 # Switch to true for fast linear training on 20M+ rows
+  alpha: 0.0001                  # Used when use_sgd is true
+  class_weight: null
+  n_jobs: -1
+  random_state: 42

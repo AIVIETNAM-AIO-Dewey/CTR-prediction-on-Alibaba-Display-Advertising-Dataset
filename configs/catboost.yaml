@@ -1,0 +1,101 @@
+# ==============================================================================
+# CTR Prediction - CatBoost Training Configuration
+# ==============================================================================
+# Fit-only (Task 3). Evaluation is Task 4, tuning is Task 5.
+#   python -m src.models.run_catboost --sample-size 100000
+# ==============================================================================
+
+model: catboost
+
+paths:
+  processed_dir: "data/processed"
+  models_dir: "models"
+  model_basename: "catboost"                           # Suffixed _fe when data.use_fe is true
+  manifest_output: "experiments/catboost_run.json"     # Training manifest, no metrics
+
+# Sampling controls (CLI flags override these)
+data:
+  use_fe: true                   # Train on train_fe.parquet / val_fe.parquet / test_fe.parquet
+  sample_size: 100000            # 0 or null -> full dataset
+  sample_fraction: null          # Alternative to sample_size, e.g. 0.05
+  random_seed: 42
+
+# Features Configuration
+features:
+  target: "clk"
+
+  # Per the Feature Decision Matrix (notebook/feature_analysis.ipynb): nonclk leaks the label,
+  # the ID/time keys are consumed by feature engineering only, cms_segid collides with cms_group_id.
+  exclude_cols:
+    - "clk"
+    - "nonclk"
+    - "datetime"
+    - "date"
+    - "time_stamp"
+    - "user"
+    - "userid"
+    - "user_id"
+    - "adgroup_id"
+    - "cms_segid"
+
+  categorical:
+    - "pid"
+    - "final_gender_code"
+    - "age_level"
+    - "pvalue_level"
+    - "shopping_level"
+    - "occupation"
+    - "new_user_class_level"
+    - "cms_group_id"
+    - "cate_id"
+    - "brand"
+    - "customer"
+    - "campaign_id"
+    - "is_weekend"
+    - "day_of_week"
+    - "hour"
+    - "gender_x_cate"
+    - "pid_x_cate"
+
+  numeric:
+    - "price"
+    - "user_adgroup_exposure_seq"
+    - "user_cate_exposure_seq"
+    - "price_log"
+    - "price_ratio_cate"
+    - "hour_sin"
+    - "hour_cos"
+    - "dow_sin"
+    - "dow_cos"
+    - "cate_id_te"
+    - "brand_te"
+    - "customer_te"
+    - "pid_te"
+
+  # Ordered target statistics already regularize the raw advertiser IDs, so unlike XGBoost
+  # (see configs/xgboost.yaml) CatBoost keeps them.
+  drop_features: []
+
+# CatBoost Hyperparameters
+params:
+  loss_function: "Logloss"
+  # Logloss, not AUC: AUC saturates in a few iterations and stops training before the
+  # probabilities are calibrated (1M-row sample: stop at iter 4 vs iter 86, worse on every metric).
+  eval_metric: "Logloss"
+  iterations: 2000
+  learning_rate: 0.05
+  depth: 8
+  l2_leaf_reg: 3.0
+  border_count: 128
+  one_hot_max_size: 10
+  max_ctr_complexity: 2          # Automatic categorical combinations (0 disables, cheaper)
+  bootstrap_type: "Bernoulli"
+  subsample: 0.8
+  rsm: 0.8
+  boosting_type: "Plain"         # 'Ordered' is less biased but far slower on 20M+ rows
+  scale_pos_weight: 1.0          # 1.0 preserves probability calibration
+  early_stopping_rounds: 100
+  task_type: "CPU"               # 'GPU' when a CUDA device is available
+  thread_count: -1
+  random_state: 42
+  verbose: 100
