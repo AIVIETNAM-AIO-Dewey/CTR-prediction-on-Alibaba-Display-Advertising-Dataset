@@ -72,8 +72,8 @@ features:
     - "customer_te"
     - "pid_te"
 
-  # High-cardinality IDs would explode one-hot dimensionality; their target encodings
-  # (*_te) represent their signals in continuous space without sparse explosion.
+  # High-cardinality IDs would explode one-hot dimensionality. Available *_te columns
+  # retain customer/brand/category signal; campaign_id is omitted because no campaign_id_te exists.
   drop_features:
     - "customer"
     - "brand"

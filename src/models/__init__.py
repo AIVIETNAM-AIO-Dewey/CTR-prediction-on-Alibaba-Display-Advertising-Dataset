@@ -21,7 +21,23 @@ def __getattr__(name: str) -> Any:
         from src.models.random_forest_model import RandomForestCTRModel
 
         return RandomForestCTRModel
+    if name in {"LightGBMModel", "LightGBMCTRModel"}:
+        from src.models.lightgbm_model import LightGBMModel
+
+        return LightGBMModel
+    if name in {"LogisticRegressionModel", "LogisticRegressionCTRModel"}:
+        from src.models.logistic_regression_model import LogisticRegressionModel
+
+        return LogisticRegressionModel
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["CatBoostCTRModel", "XGBoostCTRModel", "RandomForestCTRModel"]
+__all__ = [
+    "CatBoostCTRModel",
+    "XGBoostCTRModel",
+    "RandomForestCTRModel",
+    "LightGBMModel",
+    "LightGBMCTRModel",
+    "LogisticRegressionModel",
+    "LogisticRegressionCTRModel",
+]
