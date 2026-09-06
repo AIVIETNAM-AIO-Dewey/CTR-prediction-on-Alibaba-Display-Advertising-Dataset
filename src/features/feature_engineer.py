@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 _SPLIT_COL = "_split"
 
 
+def _duckdb_table_columns(connection: duckdb.DuckDBPyConnection, table: str) -> List[str]:
+    """Return column names from a DuckDB table's ``DESCRIBE`` output."""
+    quoted_table = '"' + str(table).replace('"', '""') + '"'
+    return [row[0] for row in connection.execute(f"DESCRIBE {quoted_table}").fetchall()]
+
+
 class CTRFeatureEngineer:
     """Generates model-ready features for the Alibaba CTR dataset."""
 
@@ -390,9 +396,6 @@ class CTRFeatureEngineer:
             text = str(value).replace("\\", "/")
             return "'" + text.replace("'", "''") + "'"
 
-        def table_columns(connection: duckdb.DuckDBPyConnection, table: str) -> List[str]:
-            return [row[1] for row in connection.execute(f"DESCRIBE {quote_identifier(table)}").fetchall()]
-
         def write_arrow_batches(source: Path, destination: Path, split_index: int) -> int:
             """Apply cheap row-local features without collecting a partition."""
             parquet = pq.ParquetFile(source)
@@ -654,7 +657,7 @@ class CTRFeatureEngineer:
                     f"COPY (SELECT {select_columns} FROM split_current ORDER BY time_stamp, _row_id) TO {quote_literal(destination)} (FORMAT PARQUET, COMPRESSION ZSTD)"
                 )
             train_destination = temporary_root / "train_fe.parquet"
-            available_columns = set(table_columns(connection, "train_current"))
+            available_columns = set(_duckdb_table_columns(connection, "train_current"))
             missing_columns = [col for col in feature_columns if col not in available_columns]
             if missing_columns:
                 raise ValueError(f"Feature schema is missing expected columns: {missing_columns}")

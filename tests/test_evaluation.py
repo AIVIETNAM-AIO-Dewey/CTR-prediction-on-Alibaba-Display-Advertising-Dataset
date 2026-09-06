@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import duckdb
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -29,7 +30,7 @@ from src.evaluate.metrics import (
     compute_threshold_metrics,
     select_best_f1_threshold,
 )
-from src.features.feature_engineer import CTRFeatureEngineer
+from src.features.feature_engineer import CTRFeatureEngineer, _duckdb_table_columns
 from src.models.catboost_model import CatBoostCTRModel
 from src.models.data_utils import load_ctr_dataset
 from src.models.logistic_regression_model import LogisticRegressionModel
@@ -276,6 +277,17 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             actual = [pl.read_parquet(output / f"{name}_fe.parquet") for name in ("train", "val", "test")]
             self.assertTrue(all(expected_frame.equals(actual_frame) for expected_frame, actual_frame in zip(expected, actual)))
             self.assertEqual(list(output.glob(".feature_engineering_*")), [])
+
+    def test_duckdb_table_columns_returns_describe_column_names(self):
+        connection = duckdb.connect()
+        try:
+            connection.execute('CREATE TABLE "feature ""current" (row_id BIGINT, label VARCHAR, score DOUBLE)')
+            self.assertEqual(
+                _duckdb_table_columns(connection, 'feature "current'),
+                ["row_id", "label", "score"],
+            )
+        finally:
+            connection.close()
 
     def test_memory_bounded_feature_engineering_rejects_non_chronological_input(self):
         with tempfile.TemporaryDirectory() as directory:
