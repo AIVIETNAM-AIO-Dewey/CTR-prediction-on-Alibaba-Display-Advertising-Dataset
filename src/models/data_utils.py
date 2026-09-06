@@ -54,14 +54,29 @@ def load_ctr_dataset(
     sample_size: Optional[int] = None,
     sample_fraction: Optional[float] = None,
     random_seed: int = 42,
+    splits: Optional[Sequence[str]] = None,
 ) -> CTRDataset:
-    """Load parquet partitions and freeze their feature order to the train schema."""
+    """Load selected parquet partitions and freeze their feature order to train.
+
+    ``splits`` defaults to all three partitions for backwards compatibility.  A
+    fit-only caller can request ``("train",)`` (or ``("train", "val")`` for
+    early stopping) so the test partition is never materialised in the training
+    process.
+    """
     if sample_size is not None and sample_size <= 0:
         sample_size = None
     if sample_fraction is not None and not 0 < sample_fraction <= 1:
         raise ValueError("sample_fraction must be in the interval (0, 1].")
     if sample_size is not None and sample_fraction is not None:
         raise ValueError("Use either sample_size or sample_fraction, not both.")
+
+    requested_splits = tuple(splits) if splits is not None else ("train", "val", "test")
+    valid_splits = {"train", "val", "test"}
+    unknown = [split for split in requested_splits if split not in valid_splits]
+    if unknown:
+        raise ValueError(f"splits must contain only train, val and test; got {unknown!r}.")
+    if "train" not in requested_splits:
+        raise ValueError("splits must include 'train' because feature schema comes from train.")
 
     directory = Path(processed_dir)
     suffix = "_fe" if use_fe else ""
@@ -70,8 +85,16 @@ def load_ctr_dataset(
         raise FileNotFoundError(f"Training partition not found: {train_path}")
 
     train = pl.read_parquet(train_path)
-    validation = _load_optional(directory / f"val{suffix}.parquet")
-    test = _load_optional(directory / f"test{suffix}.parquet")
+    validation = (
+        _load_optional(directory / f"val{suffix}.parquet")
+        if "val" in requested_splits
+        else None
+    )
+    test = (
+        _load_optional(directory / f"test{suffix}.parquet")
+        if "test" in requested_splits
+        else None
+    )
     partitions = {"train": train, "validation": validation, "test": test}
     for name, frame in partitions.items():
         if frame is not None and target_col not in frame.columns:

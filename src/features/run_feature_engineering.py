@@ -28,7 +28,11 @@ if str(ROOT_DIR) not in sys.path:
 import polars as pl
 import yaml
 
-from src.evaluate.signatures import config_fingerprint, partition_fingerprint
+from src.evaluate.signatures import (
+    config_fingerprint,
+    partition_fingerprint,
+    source_fingerprint,
+)
 from src.features.feature_engineer import CTRFeatureEngineer
 
 logging.basicConfig(
@@ -133,6 +137,12 @@ def main():
     metadata["config_fingerprint"] = config_fingerprint(args.config)
     metadata["memory_bounded"] = bool(args.memory_bounded)
     metadata["pipeline_revision"] = args.pipeline_revision
+    metadata["feature_source_fingerprint"] = source_fingerprint(
+        [
+            Path(__file__),
+            Path(__file__).with_name("feature_engineer.py"),
+        ]
+    )
     meta_path = output_dir / "feature_metadata.json"
     temporary_meta = output_dir / ".feature_metadata.json.tmp"
     with open(temporary_meta, "w", encoding="utf-8") as f:

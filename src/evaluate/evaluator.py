@@ -277,7 +277,7 @@ def write_evaluation_outputs(
         "metadata": dict(metadata or {}),
         "models": [
             {**result.to_dict(), "rank": rank_by_model[result.model_key]}
-            for result in results
+            for result in ranked
         ],
         "ranking": [
             {

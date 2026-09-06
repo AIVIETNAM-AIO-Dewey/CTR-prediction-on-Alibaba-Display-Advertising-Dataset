@@ -20,6 +20,26 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def file_sha256(path: str | Path) -> str:
+    """Hash a source/config file in bounded chunks."""
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(file_path)
+    digest = hashlib.sha256()
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_fingerprint(paths: Sequence[str | Path]) -> dict[str, str]:
+    """Return deterministic content hashes for code/config inputs."""
+    return {
+        str(Path(path).as_posix()): file_sha256(path)
+        for path in sorted((Path(path) for path in paths), key=lambda item: item.as_posix())
+    }
+
+
 def parquet_fingerprint(path: str | Path) -> dict[str, Any]:
     """Return a cheap, reproducible parquet identity without hashing all bytes."""
     parquet_path = Path(path)
@@ -60,3 +80,13 @@ def package_versions(packages: Sequence[str]) -> dict[str, str]:
 def build_run_signature(payload: Mapping[str, Any]) -> str:
     """Hash the complete run identity used by resume validation."""
     return sha256_text(canonical_json(payload))
+
+
+def build_training_signature(payload: Mapping[str, Any]) -> str:
+    """Hash only fit-time inputs; report/evaluation settings stay out of it."""
+    return build_run_signature({"kind": "training", **dict(payload)})
+
+
+def build_evaluation_signature(payload: Mapping[str, Any]) -> str:
+    """Hash evaluation inputs, including the already validated training identity."""
+    return build_run_signature({"kind": "evaluation", **dict(payload)})

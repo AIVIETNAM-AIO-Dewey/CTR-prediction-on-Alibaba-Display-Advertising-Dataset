@@ -31,6 +31,7 @@ from src.evaluate.metrics import (
 )
 from src.features.feature_engineer import CTRFeatureEngineer
 from src.models.catboost_model import CatBoostCTRModel
+from src.models.data_utils import load_ctr_dataset
 from src.models.logistic_regression_model import LogisticRegressionModel
 
 
@@ -103,7 +104,7 @@ class EvaluationOutputTests(unittest.TestCase):
             self.assertEqual(payload["ranking"][0]["model"], "synthetic")
             self.assertTrue(payload["metadata"]["test"])
 
-            result.metadata["run_signature"] = "sig"
+            result.metadata["evaluation_signature"] = "sig"
             write_evaluation_outputs(
                 [result], root / "experiments", root / "plots", metadata={"test": True}
             )
@@ -185,12 +186,70 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             self.assertEqual(result.validation.n_rows, 4)
             self.assertEqual(result.test.n_rows, 4)
 
+    def test_dataset_loader_can_omit_validation_and_test(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for split, rows in (("train", 4), ("val", 2), ("test", 2)):
+                frame = self._partition(rows)
+                frame.write_parquet(root / f"{split}.parquet")
+            dataset = load_ctr_dataset(
+                processed_dir=root,
+                use_fe=False,
+                splits=("train",),
+            )
+            self.assertIsNone(dataset.X_val)
+            self.assertIsNone(dataset.X_test)
+            dataset = load_ctr_dataset(
+                processed_dir=root,
+                use_fe=False,
+                splits=("train", "val"),
+            )
+            self.assertIsNotNone(dataset.X_val)
+            self.assertIsNone(dataset.X_test)
+
     def test_catboost_gpu_device_reaches_estimator_constructor(self):
         model = CatBoostCTRModel(task_type="GPU", devices="0:1", verbose=False)
         with patch("src.models.catboost_model.cb.CatBoostClassifier") as constructor:
             constructor.return_value.get_best_iteration.return_value = 0
             model.fit(pl.DataFrame({"feature": [0.0, 1.0, 2.0, 3.0]}), [0, 0, 1, 1])
         self.assertEqual(constructor.call_args.kwargs["devices"], "0:1")
+
+    def test_oof_target_encoding_matches_independent_reference(self):
+        frame = self._partition(12)
+        engineer = CTRFeatureEngineer(
+            {
+                "feature_engineering": {
+                    "target_encoding": {
+                        "columns": ["cate_id"],
+                        "n_folds": 3,
+                        "smoothing": 2.0,
+                        "random_seed": 42,
+                    }
+                }
+            }
+        )
+        actual = engineer.add_target_encoding_oof(frame)
+        fold_ids = np.random.RandomState(42).randint(0, 3, size=len(frame))
+        labels = np.asarray(frame["clk"].to_list(), dtype=float)
+        categories = frame["cate_id"].to_list()
+        total_positive = labels.sum()
+        expected = []
+        for index, (category, fold) in enumerate(zip(categories, fold_ids)):
+            outside = fold_ids != fold
+            category_mask = np.asarray([value == category for value in categories])
+            heldout_category = category_mask & ~outside
+            fit_category = category_mask & outside
+            fit_count = int(fit_category.sum())
+            fold_count = int(outside.sum())
+            fold_prior = (total_positive - labels[~outside].sum()) / fold_count
+            if fit_count:
+                value = (
+                    labels[fit_category].sum() + 2.0 * fold_prior
+                ) / (fit_count + 2.0)
+            else:
+                value = fold_prior
+            expected.append(value)
+        np.testing.assert_allclose(actual["cate_id_te"].to_numpy(), expected, rtol=1e-6)
 
     def test_memory_bounded_feature_engineering_matches_in_memory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -208,6 +267,7 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             CTRFeatureEngineer(config).fit_transform_partitioned_paths(*paths, output)
             actual = [pl.read_parquet(output / f"{name}_fe.parquet") for name in ("train", "val", "test")]
             self.assertTrue(all(expected_frame.equals(actual_frame) for expected_frame, actual_frame in zip(expected, actual)))
+            self.assertEqual(list(output.glob(".feature_engineering_*")), [])
 
     def test_memory_bounded_feature_engineering_rejects_non_chronological_input(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -222,6 +282,7 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
                 paths.append(path)
             with self.assertRaisesRegex(ValueError, "chronological"):
                 CTRFeatureEngineer().fit_transform_partitioned_paths(*paths, root / "engineered")
+            self.assertEqual(list((root / "engineered").glob(".feature_engineering_*")), [])
 
     def test_engineered_cache_checks_actual_files_and_config_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -266,7 +327,7 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             manifest = root / "manifest.json"
             base = {
                 "model": "logistic_regression",
-                "run_signature": "sig",
+                "training_signature": "sig",
                 "train_rows": 4,
                 "val_rows": 2,
                 "test_rows": 2,
@@ -276,10 +337,11 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             manifest.write_text(json.dumps(base), encoding="utf-8")
             loaded = load_valid_checkpoint(
                 "logistic_regression", artifact, manifest, LogisticRegressionModel.load,
-                "sig", {"train": 4, "val": 2, "test": 2},
+                expected_training_signature="sig",
+                expected_rows={"train": 4, "val": 2, "test": 2},
             )
             self.assertIsNotNone(loaded)
-            base["run_signature"] = "stale"
+            base["training_signature"] = "stale"
             manifest.write_text(json.dumps(base), encoding="utf-8")
             self.assertIsNone(load_valid_checkpoint(
                 "logistic_regression", artifact, manifest, LogisticRegressionModel.load,
