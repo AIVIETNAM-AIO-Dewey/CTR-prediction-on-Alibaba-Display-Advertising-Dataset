@@ -120,18 +120,23 @@ def load_valid_checkpoint(
             return None
         if any(int(info.get(f"{split}_rows", -1)) != int(rows) for split, rows in expected_rows.items()):
             return None
-        model = model_loader(artifact)
         if expected_feature_names is not None and list(info.get("feature_names", [])) != list(expected_feature_names):
             return None
-        if list(info.get("feature_names", [])) != list(model.feature_names):
-            return None
-        if int(info.get("n_features", -1)) != len(model.feature_names):
+        manifest_features = list(info.get("feature_names", []))
+        if int(info.get("n_features", -1)) != len(manifest_features):
             return None
         if expected_params is not None and info.get("params") != dict(expected_params):
             return None
         if expected_sampling is not None and info.get("sampling") != dict(expected_sampling):
             return None
         if expected_gpu_overrides is not None and info.get("gpu_overrides") != dict(expected_gpu_overrides):
+            return None
+        # All cheap manifest checks happen before deserializing a potentially
+        # multi-GB artifact.  Only then validate the model's embedded schema.
+        model = model_loader(artifact)
+        if list(getattr(model, "feature_names", [])) != manifest_features:
+            return None
+        if int(info.get("n_features", -1)) != len(model.feature_names):
             return None
         return model
     except Exception:

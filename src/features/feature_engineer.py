@@ -13,8 +13,11 @@ from typing import Any, Dict, List, Optional, Union
 import logging
 import math
 
+import duckdb
 import numpy as np
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -356,206 +359,328 @@ class CTRFeatureEngineer:
         val_path: str | Path,
         test_path: str | Path,
         output_dir: str | Path,
+        *,
+        memory_limit: str = "12GB",
+        batch_size: int = 250_000,
     ) -> Dict[str, Any]:
-        """Run feature engineering one parquet partition at a time.
+        """Build engineered partitions using disk-backed DuckDB execution.
 
-        The train frame is released before validation is loaded and validation is
-        released before test is loaded.  This is the entry point used by Kaggle;
-        the in-memory methods above remain available for small local workflows.
+        The in-memory ``fit_transform`` API remains available for local/small
+        data.  This path is deliberately implemented with Arrow batches and a
+        DuckDB database in the staging directory: no complete input partition,
+        category lookup, exposure state, or OOF intermediate is retained as a
+        Python/Polars object.  DuckDB is allowed to spill sort/hash state to
+        its private temporary directory.
         """
         output_root = Path(output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
-        for input_path in (train_path, val_path, test_path):
-            if not Path(input_path).exists():
-                raise FileNotFoundError(input_path)
-        exposure_state: dict[str, pl.DataFrame] = {}
-        previous_max_time: Any = None
-        counts: Dict[str, int] = {}
-        feature_columns: Optional[List[str]] = None
+        paths = {"train": Path(train_path), "val": Path(val_path), "test": Path(test_path)}
+        for path in paths.values():
+            if not path.exists():
+                raise FileNotFoundError(path)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if self.n_folds < 2:
+            raise ValueError("n_folds must be at least 2 for out-of-fold target encoding.")
 
-        def transform_exposure(frame: pl.DataFrame) -> pl.DataFrame:
-            nonlocal previous_max_time
-            if frame.is_empty():
-                raise ValueError("Feature-engineering partitions must not be empty.")
-            current_min, current_max = frame.select(
-                [
-                    pl.col("time_stamp").min().alias("_min_time"),
-                    pl.col("time_stamp").max().alias("_max_time"),
-                ]
-            ).row(0)
-            if previous_max_time is not None and current_min <= previous_max_time:
-                raise ValueError(
-                    "Expected chronological partitions train -> val -> test; "
-                    f"found {current_min!r} after {previous_max_time!r}."
-                )
-            previous_max_time = current_max
-            frame = frame.sort("time_stamp")
-            for keys, name in (
-                (["user", "adgroup_id"], "user_adgroup_exposure_seq"),
-                (["user", "cate_id"], "user_cate_exposure_seq"),
-            ):
-                state = exposure_state.get(name)
-                local = (pl.col("time_stamp").cum_count().over(keys) - 1).cast(pl.Int64)
-                if state is None:
-                    frame = frame.with_columns(local.cast(pl.Int32).alias(name))
-                else:
-                    state_col = f"_{name}_prior"
-                    frame = (
-                        frame.join(state.rename({"_count": state_col}), on=keys, how="left")
-                        .with_columns(
-                            (local + pl.col(state_col).fill_null(0))
-                            .cast(pl.Int32)
-                            .alias(name)
-                        )
-                        .drop(state_col)
-                    )
-                current_counts = frame.group_by(keys).agg(pl.len().alias("_count"))
-                if state is None:
-                    exposure_state[name] = current_counts
-                else:
-                    exposure_state[name] = (
-                        pl.concat([state, current_counts], how="vertical_relaxed")
-                        .group_by(keys)
-                        .agg(pl.col("_count").sum())
-                    )
-            return frame
+        def quote_identifier(value: str) -> str:
+            return '"' + str(value).replace('"', '""') + '"'
 
-        def collect_partition(path: str | Path) -> pl.DataFrame:
-            """Collect one lazy parquet scan using Polars' streaming engine."""
-            scan = pl.scan_parquet(path)
+        def quote_literal(value: str | Path) -> str:
+            text = str(value).replace("\\", "/")
+            return "'" + text.replace("'", "''") + "'"
+
+        def table_columns(connection: duckdb.DuckDBPyConnection, table: str) -> List[str]:
+            return [row[1] for row in connection.execute(f"DESCRIBE {quote_identifier(table)}").fetchall()]
+
+        def write_arrow_batches(source: Path, destination: Path, split_index: int) -> int:
+            """Apply cheap row-local features without collecting a partition."""
+            parquet = pq.ParquetFile(source)
+            writer: Optional[pq.ParquetWriter] = None
+            writer_schema: Optional[pa.Schema] = None
+            row_id = 0
             try:
-                return scan.collect(engine="streaming")
-            except TypeError:  # pragma: no cover - compatibility with old Polars
-                return scan.collect(streaming=True)
+                for batch in parquet.iter_batches(batch_size=batch_size):
+                    frame = pl.from_arrow(batch)
+                    frame = self.add_cross_features(self.add_cyclical_time_features(frame))
+                    frame = frame.with_columns(
+                        [
+                            pl.lit(split_index).cast(pl.Int8).alias("_split"),
+                            pl.arange(row_id, row_id + frame.height, eager=True)
+                            .cast(pl.UInt64)
+                            .alias("_row_id"),
+                        ]
+                    )
+                    arrow_table = frame.to_arrow()
+                    if writer is None:
+                        writer = pq.ParquetWriter(destination, arrow_table.schema, compression="snappy")
+                        writer_schema = arrow_table.schema
+                    elif writer_schema is not None and arrow_table.schema != writer_schema:
+                        arrow_table = arrow_table.cast(writer_schema)
+                    writer.write_table(arrow_table)
+                    row_id += frame.height
+            finally:
+                if writer is not None:
+                    writer.close()
+            if row_id == 0:
+                raise ValueError("Feature-engineering partitions must not be empty.")
+            return row_id
 
-        def write_partition(name: str, frame: pl.DataFrame, destination_root: Path) -> None:
-            nonlocal feature_columns
-            if feature_columns is None:
-                feature_columns = list(frame.columns)
-            elif list(frame.columns) != feature_columns:
-                raise ValueError(f"Feature schema changed in {name} partition.")
-            destination = destination_root / f"{name}_fe.parquet"
-            frame.write_parquet(destination, compression="snappy")
-            counts[name] = frame.height
-
-        def add_oof_columns_staged(frame: pl.DataFrame, destination_root: Path) -> pl.DataFrame:
-            """Compute OOF columns one at a time, releasing each intermediate."""
-            if self.n_folds <= np.iinfo(np.int8).max:
-                fold_dtype, fold_polars_dtype = np.int8, pl.Int8
-            elif self.n_folds <= np.iinfo(np.int16).max:
-                fold_dtype, fold_polars_dtype = np.int16, pl.Int16
-            else:
-                fold_dtype, fold_polars_dtype = np.int32, pl.Int32
-            fold_ids = np.random.RandomState(self.random_seed).randint(
-                0, self.n_folds, size=frame.height
-            ).astype(fold_dtype)
-            frame = frame.with_row_index("_te_row_id").with_columns(
-                pl.Series(
-                    "_fold",
-                    fold_ids,
-                    dtype=fold_polars_dtype,
-                )
+        def make_fold_file(connection: duckdb.DuckDBPyConnection, destination: Path, rows: int) -> None:
+            rng = np.random.RandomState(self.random_seed)
+            dtype = np.int8 if self.n_folds <= np.iinfo(np.int8).max else (
+                np.int16 if self.n_folds <= np.iinfo(np.int16).max else np.int32
             )
-            fold_totals = frame.group_by("_fold").agg(
-                [
-                    pl.col("clk").sum().alias("_fold_pos_total"),
-                    pl.len().alias("_fold_count_total"),
-                ]
-            )
-            total_positive = int(frame.select(pl.col("clk").sum()).item() or 0)
-            total_rows = int(frame.height)
-            for col in self.target_encode_cols:
-                frame = self._add_target_encoding_oof_column(
-                    frame, frame, col, fold_totals, total_positive, total_rows
+            writer: Optional[pq.ParquetWriter] = None
+            row_id = 0
+            try:
+                result = connection.execute(
+                    "SELECT _row_id FROM feature_all WHERE _split=0 ORDER BY time_stamp, _row_id"
                 )
-                staged = destination_root / f"train_oof_{col}.parquet"
-                frame.write_parquet(staged, compression="snappy")
-                del frame
-                gc.collect()
-                frame = pl.read_parquet(staged)
-            return frame.sort("_te_row_id").drop(["_fold", "_te_row_id"])
+                for batch in result.fetch_record_batch(rows_per_batch=batch_size):
+                    size = batch.num_rows
+                    folds = rng.randint(0, self.n_folds, size=size).astype(dtype, copy=False)
+                    row_ids = batch.column(0).to_numpy(zero_copy_only=False).astype(np.uint64, copy=False)
+                    table = pa.table({"_row_id": row_ids, "_fold": folds})
+                    if writer is None:
+                        writer = pq.ParquetWriter(destination, table.schema, compression="snappy")
+                    writer.write_table(table)
+                    row_id += size
+            finally:
+                if writer is not None:
+                    writer.close()
+            if row_id != rows:
+                raise RuntimeError(f"Fold map row count mismatch: expected {rows}, got {row_id}.")
 
-        def transform_target_encoding_staged(
-            frame: pl.DataFrame, name: str, destination_root: Path
-        ) -> pl.DataFrame:
-            """Apply one train-fitted lookup at a time through disk intermediates."""
-            for col in self.target_encode_cols:
-                te_col = f"{col}_te"
-                frame = frame.join(self.target_encoding_maps[col], on=col, how="left").with_columns(
-                    pl.col(te_col).fill_null(self.global_ctr)
-                )
-                staged = destination_root / f"{name}_te_{col}.parquet"
-                frame.write_parquet(staged, compression="snappy")
-                del frame
-                gc.collect()
-                frame = pl.read_parquet(staged)
-            return frame
+        def normalize_categorical_output(source: Path) -> None:
+            """Restore Polars categorical logical types without loading a partition."""
+            normalized = source.with_suffix(".normalized.parquet")
+            parquet = pq.ParquetFile(source)
+            writer: Optional[pq.ParquetWriter] = None
+            writer_schema: Optional[pa.Schema] = None
+            try:
+                for batch in parquet.iter_batches(batch_size=batch_size):
+                    frame = pl.from_arrow(batch).with_columns(
+                        [
+                            pl.col(column).cast(pl.Categorical)
+                            for column in ("gender_x_cate", "pid_x_cate")
+                            if column in batch.schema.names
+                        ]
+                    )
+                    table = frame.to_arrow()
+                    if writer is None:
+                        writer = pq.ParquetWriter(normalized, table.schema, compression="snappy")
+                        writer_schema = table.schema
+                    elif writer_schema is not None and table.schema != writer_schema:
+                        table = table.cast(writer_schema)
+                    writer.write_table(table)
+            finally:
+                if writer is not None:
+                    writer.close()
+            source.unlink()
+            normalized.replace(source)
 
-        # Keep all partially written files in an isolated directory.  A killed
-        # or failed run therefore cannot leave a mixture of old and new
-        # partitions in the cache; completed files are atomically promoted at
-        # the very end.
         temporary_root = Path(tempfile.mkdtemp(prefix=".feature_engineering_", dir=output_root))
+        spill_root = temporary_root / "duckdb_tmp"
+        spill_root.mkdir()
+        connection: Optional[duckdb.DuckDBPyConnection] = None
+        counts: Dict[str, int] = {}
         try:
-            train = transform_exposure(collect_partition(train_path))
-            train = self.add_cross_features(self.add_cyclical_time_features(train))
-            self.fit_price_stats(train)
-            train = self.add_price_features(train)
-            # Materialise the base stage to disk before the aggregate target
-            # encoding stage so the largest intermediate can be released.
-            train_base = temporary_root / "train_base.parquet"
-            train.write_parquet(train_base, compression="snappy")
-            del train
-            gc.collect()
-            train = pl.read_parquet(train_base)
-            self.fit_target_encoding(train)
-            train = add_oof_columns_staged(train, temporary_root)
-            write_partition("train", train, temporary_root)
-            del train
-            gc.collect()
+            connection = duckdb.connect(str(temporary_root / "feature_engineering.duckdb"))
+            connection.execute(f"SET memory_limit={quote_literal(memory_limit)}")
+            connection.execute(f"SET temp_directory={quote_literal(spill_root)}")
 
-            val = transform_exposure(collect_partition(val_path))
-            val = self.add_price_features(
-                self.add_cross_features(self.add_cyclical_time_features(val))
+            raw_columns = list(pq.ParquetFile(paths["train"]).schema.names)
+            for index, name in enumerate(("train", "val", "test")):
+                destination = temporary_root / f"{name}_base.parquet"
+                counts[name] = write_arrow_batches(paths[name], destination, index)
+                connection.execute(
+                    f"CREATE OR REPLACE VIEW {quote_identifier(name + '_base')} AS "
+                    f"SELECT * FROM read_parquet({quote_literal(destination)})"
+                )
+
+            # Validate partition chronology using scalar aggregates only.
+            chronology = []
+            for name in ("train", "val", "test"):
+                chronology.append(connection.execute(
+                    f"SELECT min(time_stamp), max(time_stamp), count(*) FROM {quote_identifier(name + '_base')}"
+                ).fetchone())
+            for previous, current in zip(chronology, chronology[1:]):
+                if current[0] is None or previous[1] is None or current[0] <= previous[1]:
+                    raise ValueError(
+                        "Expected chronological partitions train -> val -> test; "
+                        f"found {current[0]!r} after {previous[1]!r}."
+                    )
+
+            connection.execute(
+                """CREATE OR REPLACE TABLE base_all AS
+                   SELECT * FROM train_base
+                   UNION ALL SELECT * FROM val_base
+                   UNION ALL SELECT * FROM test_base"""
             )
-            val_base = temporary_root / "val_base.parquet"
-            val.write_parquet(val_base, compression="snappy")
-            del val
-            gc.collect()
-            val = transform_target_encoding_staged(pl.read_parquet(val_base), "val", temporary_root)
-            write_partition("val", val, temporary_root)
-            del val
-            gc.collect()
-
-            test = transform_exposure(collect_partition(test_path))
-            test = self.add_price_features(
-                self.add_cross_features(self.add_cyclical_time_features(test))
+            q_user, q_ad, q_cate, q_time = (quote_identifier(c) for c in ("user", "adgroup_id", "cate_id", "time_stamp"))
+            connection.execute(
+                f"""CREATE OR REPLACE TABLE exposure_all AS
+                SELECT b.* EXCLUDE (_split, _row_id), _split, _row_id,
+                    CAST(row_number() OVER (PARTITION BY {q_user}, {q_ad}
+                        ORDER BY {q_time}, _split, _row_id) - 1 AS INTEGER) AS user_adgroup_exposure_seq,
+                    CAST(row_number() OVER (PARTITION BY {q_user}, {q_cate}
+                        ORDER BY {q_time}, _split, _row_id) - 1 AS INTEGER) AS user_cate_exposure_seq
+                FROM base_all b"""
             )
-            test_base = temporary_root / "test_base.parquet"
-            test.write_parquet(test_base, compression="snappy")
-            del test
-            gc.collect()
-            test = transform_target_encoding_staged(pl.read_parquet(test_base), "test", temporary_root)
-            write_partition("test", test, temporary_root)
-            del test
-            gc.collect()
 
+            global_median = connection.execute("SELECT median(price) FROM exposure_all WHERE _split=0").fetchone()[0]
+            if global_median is None:
+                global_median = 0.0
+            connection.execute(
+                """CREATE OR REPLACE TABLE price_stats AS
+                   SELECT cate_id, median(price) AS _cate_median_price
+                   FROM exposure_all WHERE _split=0 GROUP BY cate_id"""
+            )
+            connection.execute(
+                f"""CREATE OR REPLACE TABLE feature_all AS
+                SELECT x.* EXCLUDE (_cate_median_price),
+                    CAST(ln(1 + price) AS FLOAT) AS price_log,
+                    CAST(price / CASE WHEN coalesce(_cate_median_price, {float(global_median)}) > 0
+                        THEN coalesce(_cate_median_price, {float(global_median)}) ELSE 1.0 END AS FLOAT)
+                        AS price_ratio_cate
+                FROM (
+                    SELECT e.*, p._cate_median_price
+                    FROM exposure_all e
+                    LEFT JOIN price_stats p ON e.cate_id IS NOT DISTINCT FROM p.cate_id
+                ) x"""
+            )
+            self.global_median_price = float(global_median)
+            self.global_ctr = float(connection.execute("SELECT avg(clk) FROM feature_all WHERE _split=0").fetchone()[0] or 0.0)
+            self.cate_median_price = None
+            self.target_encoding_maps = {}
+
+            fold_path = temporary_root / "folds.parquet"
+            make_fold_file(connection, fold_path, counts["train"])
+            connection.execute(
+                f"""CREATE OR REPLACE TABLE train_current AS
+                SELECT f.*, m._fold
+                FROM feature_all f JOIN read_parquet({quote_literal(fold_path)}) m USING (_row_id)
+                WHERE f._split=0"""
+            )
+            total_positive, total_rows = connection.execute(
+                "SELECT sum(clk), count(*) FROM train_current"
+            ).fetchone()
+            total_positive = int(total_positive or 0)
+            total_rows = int(total_rows)
+            connection.execute(
+                """CREATE OR REPLACE TABLE fold_totals AS
+                   SELECT _fold, sum(clk) AS _fold_pos_total, count(*) AS _fold_count_total
+                   FROM train_current GROUP BY _fold"""
+            )
+
+            for col in self.target_encode_cols:
+                qc = quote_identifier(col)
+                te_col = quote_identifier(f"{col}_te")
+                connection.execute(
+                    f"""CREATE OR REPLACE TABLE global_stats AS
+                    SELECT {qc}, sum(clk) AS _global_pos, count(*) AS _global_count
+                    FROM train_current GROUP BY {qc}"""
+                )
+                connection.execute(
+                    f"""CREATE OR REPLACE TABLE fold_stats AS
+                    SELECT {qc}, _fold, sum(clk) AS _heldout_pos, count(*) AS _heldout_count
+                    FROM train_current GROUP BY {qc}, _fold"""
+                )
+                connection.execute("DROP TABLE IF EXISTS train_next")
+                connection.execute(
+                    f"""CREATE TABLE train_next AS
+                    SELECT t.*,
+                        CAST(CASE WHEN coalesce(g._global_count, 0) - coalesce(h._heldout_count, 0) > 0
+                            THEN (coalesce(g._global_pos, 0) - coalesce(h._heldout_pos, 0)
+                                + {float(self.smoothing)} * CASE WHEN {total_rows} - ft._fold_count_total > 0
+                                    THEN ({total_positive} - ft._fold_pos_total) / CAST({total_rows} - ft._fold_count_total AS DOUBLE)
+                                    ELSE {self.global_ctr} END)
+                                / (g._global_count - h._heldout_count + {float(self.smoothing)})
+                            ELSE CASE WHEN {total_rows} - ft._fold_count_total > 0
+                                THEN ({total_positive} - ft._fold_pos_total) / CAST({total_rows} - ft._fold_count_total AS DOUBLE)
+                                ELSE {self.global_ctr} END END AS FLOAT) AS {te_col}
+                    FROM train_current t
+                    LEFT JOIN global_stats g ON t.{qc} IS NOT DISTINCT FROM g.{qc}
+                    LEFT JOIN fold_stats h ON t.{qc} IS NOT DISTINCT FROM h.{qc} AND t._fold = h._fold
+                    LEFT JOIN fold_totals ft ON t._fold = ft._fold"""
+                )
+                connection.execute("DROP TABLE train_current")
+                connection.execute("ALTER TABLE train_next RENAME TO train_current")
+
+            feature_columns = [
+                *raw_columns,
+                "user_adgroup_exposure_seq",
+                "user_cate_exposure_seq",
+                "hour_sin",
+                "hour_cos",
+                "dow_sin",
+                "dow_cos",
+                "gender_x_cate",
+                "pid_x_cate",
+                "price_log",
+                "price_ratio_cate",
+                *[f"{col}_te" for col in self.target_encode_cols],
+            ]
+            select_columns = ", ".join(quote_identifier(col) for col in feature_columns)
+            # Full-train lookup maps are materialized one column at a time and
+            # applied to val/test sequentially; no Python lookup dictionary is retained.
+            connection.execute("DROP TABLE IF EXISTS split_current")
+            for split_index, name in ((1, "val"), (2, "test")):
+                connection.execute(
+                    f"CREATE OR REPLACE TABLE split_current AS SELECT * FROM feature_all WHERE _split={split_index}"
+                )
+                for col in self.target_encode_cols:
+                    qc = quote_identifier(col)
+                    te_col = quote_identifier(f"{col}_te")
+                    connection.execute(
+                        f"""CREATE OR REPLACE TABLE target_map AS
+                        SELECT {qc}, CAST((sum(clk) + {float(self.smoothing)} * {self.global_ctr}) /
+                            (count(*) + {float(self.smoothing)}) AS FLOAT) AS {te_col}
+                        FROM train_current GROUP BY {qc}"""
+                    )
+                    connection.execute("DROP TABLE IF EXISTS split_next")
+                    connection.execute(
+                        f"""CREATE TABLE split_next AS
+                        SELECT s.*,
+                            CAST(coalesce(m.{te_col}, {self.global_ctr}) AS FLOAT) AS {te_col}
+                        FROM split_current s
+                        LEFT JOIN target_map m ON s.{qc} IS NOT DISTINCT FROM m.{qc}"""
+                    )
+                    connection.execute("DROP TABLE split_current")
+                    connection.execute("ALTER TABLE split_next RENAME TO split_current")
+                destination = temporary_root / f"{name}_fe.parquet"
+                connection.execute(
+                    f"COPY (SELECT {select_columns} FROM split_current ORDER BY time_stamp, _row_id) TO {quote_literal(destination)} (FORMAT PARQUET, COMPRESSION ZSTD)"
+                )
+            train_destination = temporary_root / "train_fe.parquet"
+            available_columns = set(table_columns(connection, "train_current"))
+            missing_columns = [col for col in feature_columns if col not in available_columns]
+            if missing_columns:
+                raise ValueError(f"Feature schema is missing expected columns: {missing_columns}")
+            connection.execute(
+                f"COPY (SELECT {select_columns} FROM train_current ORDER BY time_stamp, _row_id) TO {quote_literal(train_destination)} (FORMAT PARQUET, COMPRESSION ZSTD)"
+            )
+            for name in ("train", "val", "test"):
+                normalize_categorical_output(temporary_root / f"{name}_fe.parquet")
             for name in ("train", "val", "test"):
                 source = temporary_root / f"{name}_fe.parquet"
                 destination = output_root / f"{name}_fe.parquet"
                 source.replace(destination)
         finally:
+            if connection is not None:
+                connection.close()
             shutil.rmtree(temporary_root, ignore_errors=True)
 
         return {
             "num_train_rows": counts["train"],
             "num_val_rows": counts["val"],
             "num_test_rows": counts["test"],
-            "columns": feature_columns or [],
+            "columns": feature_columns,
             "target_encode_columns": list(self.target_encode_cols),
             "target_encoding_smoothing": self.smoothing,
             "target_encoding_n_folds": self.n_folds,
-            "target_encoding_fold_strategy": "random_state_aggregate",
+            "target_encoding_fold_strategy": "random_state_aggregate_disk_backed",
             "global_train_ctr": self.global_ctr,
             "global_median_price": self.global_median_price,
         }

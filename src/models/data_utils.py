@@ -40,8 +40,11 @@ def _sample(
     return frame
 
 
-def _load_optional(path: Path) -> Optional[pl.DataFrame]:
-    return pl.read_parquet(path) if path.exists() else None
+def _load_requested(path: Path, split: str) -> pl.DataFrame:
+    """Read a requested split and fail loudly when its file is absent."""
+    if not path.exists():
+        raise FileNotFoundError(f"Requested {split} partition not found: {path}")
+    return pl.read_parquet(path)
 
 
 def load_ctr_dataset(
@@ -86,12 +89,12 @@ def load_ctr_dataset(
 
     train = pl.read_parquet(train_path)
     validation = (
-        _load_optional(directory / f"val{suffix}.parquet")
+        _load_requested(directory / f"val{suffix}.parquet", "val")
         if "val" in requested_splits
         else None
     )
     test = (
-        _load_optional(directory / f"test{suffix}.parquet")
+        _load_requested(directory / f"test{suffix}.parquet", "test")
         if "test" in requested_splits
         else None
     )

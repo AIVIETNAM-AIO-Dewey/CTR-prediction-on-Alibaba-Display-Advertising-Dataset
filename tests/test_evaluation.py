@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -207,6 +207,13 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             self.assertIsNotNone(dataset.X_val)
             self.assertIsNone(dataset.X_test)
 
+    def test_dataset_loader_rejects_missing_requested_split(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._partition(4).write_parquet(root / "train.parquet")
+            with self.assertRaisesRegex(FileNotFoundError, "val partition"):
+                load_ctr_dataset(processed_dir=root, use_fe=False, splits=("train", "val"))
+
     def test_catboost_gpu_device_reaches_estimator_constructor(self):
         model = CatBoostCTRModel(task_type="GPU", devices="0:1", verbose=False)
         with patch("src.models.catboost_model.cb.CatBoostClassifier") as constructor:
@@ -264,7 +271,8 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             config = {"feature_engineering": {"target_encoding": {"n_folds": 2}}}
             expected = CTRFeatureEngineer(config).fit_transform(*partitions)
             output = root / "engineered"
-            CTRFeatureEngineer(config).fit_transform_partitioned_paths(*paths, output)
+            with patch("src.features.feature_engineer.pl.read_parquet", side_effect=AssertionError("partition must stay disk-backed")):
+                CTRFeatureEngineer(config).fit_transform_partitioned_paths(*paths, output)
             actual = [pl.read_parquet(output / f"{name}_fe.parquet") for name in ("train", "val", "test")]
             self.assertTrue(all(expected_frame.equals(actual_frame) for expected_frame, actual_frame in zip(expected, actual)))
             self.assertEqual(list(output.glob(".feature_engineering_*")), [])
@@ -347,6 +355,31 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
                 "logistic_regression", artifact, manifest, LogisticRegressionModel.load,
                 "sig", {"train": 4, "val": 2, "test": 2},
             ))
+
+    def test_checkpoint_rejects_manifest_before_loading_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.joblib"
+            artifact.write_bytes(b"not a model")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "model": "logistic_regression",
+                "training_signature": "sig",
+                "train_rows": 4,
+                "val_rows": 0,
+                "test_rows": 0,
+                "n_features": 1,
+                "feature_names": ["price"],
+                "params": {"max_iter": 10},
+            }), encoding="utf-8")
+            loader = Mock(side_effect=AssertionError("artifact must not be loaded"))
+            self.assertIsNone(load_valid_checkpoint(
+                "logistic_regression", artifact, manifest, loader,
+                expected_training_signature="sig",
+                expected_rows={"train": 4, "val": 0, "test": 0},
+                expected_params={"max_iter": 11},
+            ))
+            loader.assert_not_called()
 
     def test_release_iteration_state_clears_large_locals(self):
         namespace = {name: object() for name in ("run", "model", "X_val", "X_test", "y_val", "y_test", "p_val", "p_test")}

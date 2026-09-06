@@ -69,7 +69,19 @@ def parse_args():
     parser.add_argument(
         "--memory-bounded",
         action="store_true",
-        help="Process train/val/test one partition at a time and write atomic outputs.",
+        help="Use Arrow batches and disk-backed DuckDB spill execution.",
+    )
+    parser.add_argument(
+        "--memory-limit",
+        type=str,
+        default="12GB",
+        help="DuckDB memory limit for --memory-bounded (default: 12GB).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=250_000,
+        help="Arrow record-batch size for --memory-bounded (default: 250000).",
     )
     parser.add_argument(
         "--pipeline-revision",
@@ -108,7 +120,12 @@ def main():
     if args.memory_bounded:
         logger.info(f"Reading preprocessed partitions one at a time from: {input_dir}")
         metadata = engineer.fit_transform_partitioned_paths(
-            train_path, val_path, test_path, output_dir
+            train_path,
+            val_path,
+            test_path,
+            output_dir,
+            memory_limit=args.memory_limit,
+            batch_size=args.batch_size,
         )
     else:
         logger.info(f"Reading preprocessed partitions from: {input_dir}")
@@ -136,6 +153,8 @@ def main():
     metadata["schema"] = partition_fingerprint(output_dir, suffix="_fe")["train"]["schema"]
     metadata["config_fingerprint"] = config_fingerprint(args.config)
     metadata["memory_bounded"] = bool(args.memory_bounded)
+    metadata["memory_limit"] = args.memory_limit if args.memory_bounded else None
+    metadata["batch_size"] = args.batch_size if args.memory_bounded else None
     metadata["pipeline_revision"] = args.pipeline_revision
     metadata["feature_source_fingerprint"] = source_fingerprint(
         [
