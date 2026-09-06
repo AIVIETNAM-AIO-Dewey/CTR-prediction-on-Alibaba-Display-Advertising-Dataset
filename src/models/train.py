@@ -1,5 +1,5 @@
 """
-Shared Fitting Logic for the Tree-Based CTR Models.
+Shared fitting logic for CTR models.
 
 Turns one model YAML configuration into a fitted, persisted artifact (Task 3). Computes no
 metrics: evaluation is Task 4 (src/evaluate/) and tuning is Task 5 (experiments/tune_optuna.py).
@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 import inspect
+import importlib
 import json
 import logging
 import sys
@@ -27,11 +28,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import yaml
 
-from src.models.base_model import BaseCTRModel
-from src.models.catboost_model import CatBoostCTRModel
 from src.models.data_utils import CTRDataset, load_ctr_dataset
-from src.models.random_forest_model import RandomForestCTRModel
-from src.models.xgboost_model import XGBoostCTRModel
 
 logger = logging.getLogger(__name__)
 
@@ -40,20 +37,38 @@ logger = logging.getLogger(__name__)
 class ModelSpec:
     """The wrapper class implementing a model, and the config that drives it."""
 
-    model_class: Type[BaseCTRModel]
+    module: str
+    class_name: str
     config_path: str
 
 
 MODEL_REGISTRY: Dict[str, ModelSpec] = {
-    "catboost": ModelSpec(CatBoostCTRModel, "configs/catboost.yaml"),
-    "xgboost": ModelSpec(XGBoostCTRModel, "configs/xgboost.yaml"),
-    "random_forest": ModelSpec(RandomForestCTRModel, "configs/random_forest.yaml"),
+    "catboost": ModelSpec(
+        "src.models.catboost_model", "CatBoostCTRModel", "configs/catboost.yaml"
+    ),
+    "xgboost": ModelSpec(
+        "src.models.xgboost_model", "XGBoostCTRModel", "configs/xgboost.yaml"
+    ),
+    "random_forest": ModelSpec(
+        "src.models.random_forest_model",
+        "RandomForestCTRModel",
+        "configs/random_forest.yaml",
+    ),
+    "lightgbm": ModelSpec(
+        "src.models.lightgbm_model", "LightGBMModel", "configs/lightgbm.yaml"
+    ),
+    "logistic_regression": ModelSpec(
+        "src.models.logistic_regression_model",
+        "LogisticRegressionModel",
+        "configs/logistic_regression.yaml",
+    ),
 }
 
 
-def get_model_class(model_key: str) -> Type[BaseCTRModel]:
+def get_model_class(model_key: str) -> Type[Any]:
     """Return the wrapper class registered for a model key."""
-    return MODEL_REGISTRY[_validate_model_key(model_key)].model_class
+    spec = MODEL_REGISTRY[_validate_model_key(model_key)]
+    return getattr(importlib.import_module(spec.module), spec.class_name)
 
 
 @dataclass
@@ -61,7 +76,7 @@ class FitResult:
     """Everything a single training run produced."""
 
     model_key: str
-    model: BaseCTRModel
+    model: Any
     dataset: CTRDataset
     artifact_path: Path
     manifest: Dict[str, Any] = field(default_factory=dict)
@@ -100,6 +115,7 @@ def _build_kwargs(model_cls, params: Dict[str, Any], random_seed: int) -> Dict[s
         "self",
         "config",
         "categorical_features",
+        "numeric_features",
     }
     kwargs = {k: v for k, v in params.items() if k in accepted}
     ignored = sorted(set(params) - accepted)
@@ -113,8 +129,7 @@ def _scope_dataset(dataset: CTRDataset, drop_features: Optional[List[str]]) -> C
     """
     Return a view of the dataset with `drop_features` removed from every partition.
 
-    XGBoost memorizes raw high-cardinality advertiser IDs, so its config drops them in favour of
-    the smoothed `*_te` encodings; CatBoost's ordered target statistics regularize them already.
+    Each config can remove raw high-cardinality IDs before fitting its model.
     """
     drop = [c for c in (drop_features or []) if c in dataset.X_train.columns]
     if not drop:
@@ -157,9 +172,13 @@ def load_dataset_from_config(
 
     use_fe = data_cfg.get("use_fe", True) if use_fe is None else use_fe
     seed = data_cfg.get("random_seed", 42) if random_seed is None else random_seed
-    if sample_size is None:
+    # Explicit CLI/API overrides win over the alternate sampling mode from YAML.
+    if sample_fraction is not None:
+        sample_size = None
+    elif sample_size is not None:
+        sample_fraction = None
+    else:
         sample_size = data_cfg.get("sample_size")
-    if sample_fraction is None:
         sample_fraction = data_cfg.get("sample_fraction")
     # 0 / negative means "use the full dataset"
     if sample_size is not None and sample_size <= 0:
@@ -202,7 +221,7 @@ def fit_from_config(
     Args:
         config_path: Path to the model YAML (defaults to the registry path for `model_key`).
         config: Already-parsed config dict, taking precedence over `config_path`.
-        model_key: 'catboost' or 'xgboost'. Defaults to the config's own `model:` field.
+        model_key: Registry key for one model. Defaults to the config's `model:` field.
         processed_dir: Override for the parquet partition directory.
         models_dir: Override for the artifact destination directory.
         use_fe: Override for `data.use_fe`.
@@ -246,16 +265,24 @@ def fit_from_config(
             sample_fraction=sample_fraction,
             random_seed=seed,
         )
+    else:
+        dataset = _scope_dataset(
+            dataset, config.get("features", {}).get("drop_features")
+        )
 
     # Fit-time arguments, not constructor arguments.
     early_stopping_rounds = params.pop("early_stopping_rounds", 100)
     verbose_eval = params.pop("verbose_eval", 50)
 
-    model = model_cls(
-        categorical_features=dataset.categorical_features,
-        config=params,
-        **_build_kwargs(model_cls, params, seed),
-    )
+    constructor_params = inspect.signature(model_cls.__init__).parameters
+    model_kwargs = _build_kwargs(model_cls, params, seed)
+    if "categorical_features" in constructor_params:
+        model_kwargs["categorical_features"] = dataset.categorical_features
+    if "numeric_features" in constructor_params:
+        model_kwargs["numeric_features"] = dataset.numeric_features
+    if "config" in constructor_params:
+        model_kwargs["config"] = config
+    model = model_cls(**model_kwargs)
 
     # Forward only the fit-time arguments this wrapper declares: a forest has neither early
     # stopping nor per-round logging, so passing them through would reach sklearn and fail.
@@ -282,12 +309,9 @@ def fit_from_config(
     artifact_path = Path(models_dir or paths_cfg.get("models_dir", "models")) / (
         f"{basename}{'_fe' if use_fe else '_baseline'}.joblib"
     )
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
     if save_artifact:
-        try:
-            model.save(artifact_path)
-        except Exception as exc:
-            logger.warning(f"Could not save model to {artifact_path}: {exc}")
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        model.save(artifact_path)
 
     manifest = {
         "model": model_key,

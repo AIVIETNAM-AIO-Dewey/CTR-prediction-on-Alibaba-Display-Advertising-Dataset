@@ -1,0 +1,103 @@
+# ==============================================================================
+# CTR Prediction - LightGBM Training Configuration
+# ==============================================================================
+# Fit-only (Task 3). Evaluation is Task 4, tuning is Task 5.
+#   python -m src.models.run_lightgbm --sample-size 100000
+# ==============================================================================
+
+model: lightgbm
+
+paths:
+  processed_dir: "data/processed"
+  models_dir: "models"
+  model_basename: "lightgbm"                           # Suffixed _fe when data.use_fe is true
+  manifest_output: "experiments/lightgbm_run.json"     # Training manifest, no metrics
+
+# Sampling controls (CLI flags override these)
+data:
+  use_fe: true                   # Train on train_fe.parquet / val_fe.parquet / test_fe.parquet
+  sample_size: 100000            # 0 or null -> full dataset
+  sample_fraction: null          # Alternative to sample_size, e.g. 0.05
+  random_seed: 42
+
+# Features Configuration
+features:
+  target: "clk"
+
+  # Per the Feature Decision Matrix: nonclk leaks the label,
+  # the ID/time keys are consumed by feature engineering only, cms_segid collides with cms_group_id.
+  exclude_cols:
+    - "clk"
+    - "nonclk"
+    - "datetime"
+    - "date"
+    - "time_stamp"
+    - "user"
+    - "userid"
+    - "user_id"
+    - "adgroup_id"
+    - "cms_segid"
+
+  categorical:
+    - "pid"
+    - "final_gender_code"
+    - "age_level"
+    - "pvalue_level"
+    - "shopping_level"
+    - "occupation"
+    - "new_user_class_level"
+    - "cms_group_id"
+    - "cate_id"
+    - "brand"
+    - "customer"
+    - "campaign_id"
+    - "is_weekend"
+    - "day_of_week"
+    - "hour"
+    - "gender_x_cate"
+    - "pid_x_cate"
+
+  numeric:
+    - "price"
+    - "user_adgroup_exposure_seq"
+    - "user_cate_exposure_seq"
+    - "price_log"
+    - "price_ratio_cate"
+    - "hour_sin"
+    - "hour_cos"
+    - "dow_sin"
+    - "dow_cos"
+    - "cate_id_te"
+    - "brand_te"
+    - "customer_te"
+    - "pid_te"
+
+  # Drop raw advertiser IDs with extreme cardinality (>100k) to prevent memorization/overfitting;
+  # smoothed out-of-fold target encodings (*_te) represent their signal instead.
+  drop_features:
+    - "customer"
+    - "brand"
+
+# LightGBM Hyperparameters
+params:
+  objective: "binary"
+  metric:
+    - "binary_logloss"
+    - "auc"
+  boosting_type: "gbdt"
+  learning_rate: 0.05
+  num_leaves: 63
+  max_depth: 8
+  min_child_samples: 50
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  n_estimators: 2000
+  scale_pos_weight: 1.0
+  early_stopping_rounds: 100
+  verbose_eval: 50
+  n_jobs: -1
+  random_state: 42
+  verbose: -1
