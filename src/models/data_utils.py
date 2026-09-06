@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import polars as pl
 
@@ -40,8 +40,11 @@ def _sample(
     return frame
 
 
-def _load_optional(path: Path) -> Optional[pl.DataFrame]:
-    return pl.read_parquet(path) if path.exists() else None
+def _load_requested(path: Path, split: str) -> pl.DataFrame:
+    """Read a requested split and fail loudly when its file is absent."""
+    if not path.exists():
+        raise FileNotFoundError(f"Requested {split} partition not found: {path}")
+    return pl.read_parquet(path)
 
 
 def load_ctr_dataset(
@@ -54,14 +57,29 @@ def load_ctr_dataset(
     sample_size: Optional[int] = None,
     sample_fraction: Optional[float] = None,
     random_seed: int = 42,
+    splits: Optional[Sequence[str]] = None,
 ) -> CTRDataset:
-    """Load parquet partitions and freeze their feature order to the train schema."""
+    """Load selected parquet partitions and freeze their feature order to train.
+
+    ``splits`` defaults to all three partitions for backwards compatibility.  A
+    fit-only caller can request ``("train",)`` (or ``("train", "val")`` for
+    early stopping) so the test partition is never materialised in the training
+    process.
+    """
     if sample_size is not None and sample_size <= 0:
         sample_size = None
     if sample_fraction is not None and not 0 < sample_fraction <= 1:
         raise ValueError("sample_fraction must be in the interval (0, 1].")
     if sample_size is not None and sample_fraction is not None:
         raise ValueError("Use either sample_size or sample_fraction, not both.")
+
+    requested_splits = tuple(splits) if splits is not None else ("train", "val", "test")
+    valid_splits = {"train", "val", "test"}
+    unknown = [split for split in requested_splits if split not in valid_splits]
+    if unknown:
+        raise ValueError(f"splits must contain only train, val and test; got {unknown!r}.")
+    if "train" not in requested_splits:
+        raise ValueError("splits must include 'train' because feature schema comes from train.")
 
     directory = Path(processed_dir)
     suffix = "_fe" if use_fe else ""
@@ -70,8 +88,16 @@ def load_ctr_dataset(
         raise FileNotFoundError(f"Training partition not found: {train_path}")
 
     train = pl.read_parquet(train_path)
-    validation = _load_optional(directory / f"val{suffix}.parquet")
-    test = _load_optional(directory / f"test{suffix}.parquet")
+    validation = (
+        _load_requested(directory / f"val{suffix}.parquet", "val")
+        if "val" in requested_splits
+        else None
+    )
+    test = (
+        _load_requested(directory / f"test{suffix}.parquet", "test")
+        if "test" in requested_splits
+        else None
+    )
     partitions = {"train": train, "validation": validation, "test": test}
     for name, frame in partitions.items():
         if frame is not None and target_col not in frame.columns:
@@ -132,3 +158,38 @@ def load_ctr_dataset(
         categorical_features=cats,
         numeric_features=nums,
     )
+
+
+def load_ctr_partition(
+    processed_dir: str,
+    split: str,
+    feature_names: Sequence[str],
+    target_col: str = "clk",
+    use_fe: bool = True,
+    sample_size: Optional[int] = None,
+    sample_fraction: Optional[float] = None,
+    random_seed: int = 42,
+) -> Tuple[pl.DataFrame, pl.Series]:
+    """Load only the columns needed to evaluate one persisted model."""
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"split must be one of train, val, test; got {split!r}.")
+    if sample_size is not None and sample_size <= 0:
+        sample_size = None
+    if sample_fraction is not None and not 0 < sample_fraction <= 1:
+        raise ValueError("sample_fraction must be in the interval (0, 1].")
+    if sample_size is not None and sample_fraction is not None:
+        raise ValueError("Use either sample_size or sample_fraction, not both.")
+
+    suffix = "_fe" if use_fe else ""
+    path = Path(processed_dir) / f"{split}{suffix}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{split} partition not found: {path}")
+    requested = list(dict.fromkeys([target_col, *feature_names]))
+    schema = pl.read_parquet_schema(path)
+    missing = [column for column in requested if column not in schema]
+    if missing:
+        raise ValueError(f"{split} partition is missing required column(s): {missing}")
+
+    frame = pl.scan_parquet(path).select(requested).collect()
+    frame = _sample(frame, sample_size, sample_fraction, random_seed)
+    return frame.select(list(feature_names)), frame.get_column(target_col)

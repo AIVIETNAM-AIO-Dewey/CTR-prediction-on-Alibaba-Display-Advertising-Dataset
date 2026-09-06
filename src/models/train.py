@@ -160,6 +160,7 @@ def load_dataset_from_config(
     sample_fraction: Optional[float] = None,
     random_seed: Optional[int] = None,
     apply_drop_features: bool = True,
+    splits: Optional[List[str]] = None,
 ) -> CTRDataset:
     """
     Build the exact dataset view a config describes.
@@ -194,6 +195,7 @@ def load_dataset_from_config(
         sample_size=sample_size,
         sample_fraction=sample_fraction,
         random_seed=seed,
+        splits=splits,
     )
 
     if apply_drop_features:
@@ -211,9 +213,12 @@ def fit_from_config(
     sample_size: Optional[int] = None,
     sample_fraction: Optional[float] = None,
     random_seed: Optional[int] = None,
+    run_signature: Optional[str] = None,
+    training_signature: Optional[str] = None,
     save_artifact: bool = True,
     write_manifest: bool = True,
     dataset: Optional[CTRDataset] = None,
+    splits: Optional[List[str]] = None,
 ) -> FitResult:
     """
     Fit the single tree model described by one YAML config, then persist it.
@@ -228,9 +233,13 @@ def fit_from_config(
         sample_size: Override for `data.sample_size` (0 or None -> full dataset).
         sample_fraction: Override for `data.sample_fraction`.
         random_seed: Override for `data.random_seed`.
+        run_signature: Deprecated alias for ``training_signature``.
+        training_signature: Identity used to validate resumable artifacts.
         save_artifact: Whether to serialize the fitted model to `models_dir`.
         write_manifest: Whether to write the JSON training manifest.
         dataset: Pre-loaded dataset, to fit several configs without re-reading parquet.
+        splits: Optional partitions to load when ``dataset`` is not supplied. The
+            default keeps the historical train/validation/test behaviour.
 
     Returns:
         FitResult: the fitted model, the dataset it was fitted on, and the run manifest.
@@ -241,6 +250,9 @@ def fit_from_config(
                 raise ValueError("Provide one of: config, config_path, or model_key.")
             config_path = default_config_path(model_key)
         config = load_config(config_path)
+
+    if training_signature is None:
+        training_signature = run_signature
 
     model_key = _validate_model_key(model_key or config.get("model", ""))
     model_cls = get_model_class(model_key)
@@ -264,6 +276,7 @@ def fit_from_config(
             sample_size=sample_size,
             sample_fraction=sample_fraction,
             random_seed=seed,
+            splits=splits,
         )
     else:
         dataset = _scope_dataset(
@@ -304,6 +317,18 @@ def fit_from_config(
     elapsed = time.time() - start
     logger.info(f"Training finished in {elapsed:.1f}s.")
 
+    if sample_fraction is not None:
+        effective_sample_size = None
+        effective_sample_fraction = sample_fraction
+    elif sample_size is not None:
+        effective_sample_size = sample_size
+        effective_sample_fraction = None
+    else:
+        effective_sample_size = data_cfg.get("sample_size")
+        effective_sample_fraction = data_cfg.get("sample_fraction")
+    if effective_sample_size is not None and effective_sample_size <= 0:
+        effective_sample_size = None
+
     # Persist the artifact Task 4 will load.
     basename = paths_cfg.get("model_basename", model_key)
     artifact_path = Path(models_dir or paths_cfg.get("models_dir", "models")) / (
@@ -319,6 +344,10 @@ def fit_from_config(
         "artifact_path": str(artifact_path),
         "use_fe": bool(use_fe),
         "random_seed": seed,
+        "training_signature": training_signature,
+        # Keep the old key in manifests written by callers that still inspect
+        # it, while the new checkpoint validator requires training_signature.
+        "run_signature": training_signature,
         "train_rows": int(len(dataset.X_train)),
         "val_rows": int(len(dataset.X_val)) if dataset.X_val is not None else 0,
         "test_rows": int(len(dataset.X_test)) if dataset.X_test is not None else 0,
@@ -331,6 +360,16 @@ def fit_from_config(
         "best_iteration": int(getattr(model, "best_iteration_", 0) or 0),
         "train_seconds": round(elapsed, 2),
         "params": params,
+        "sampling": {
+            "sample_size": effective_sample_size,
+            "sample_fraction": effective_sample_fraction,
+            "random_seed": seed,
+        },
+        "gpu_overrides": {
+            key: params[key]
+            for key in ("device", "task_type", "devices", "rsm")
+            if key in params
+        },
     }
 
     manifest_path = None

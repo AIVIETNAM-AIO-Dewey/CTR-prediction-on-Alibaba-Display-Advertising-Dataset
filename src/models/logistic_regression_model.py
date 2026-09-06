@@ -198,7 +198,7 @@ class LogisticRegressionModel:
             pl.col(column).cast(pl.Float64, strict=False).alias(column)
             for column in self.active_numeric_features_
         ]
-        values = np.asarray(frame.select(expressions).to_numpy(), dtype=np.float64)
+        values = np.array(frame.select(expressions).to_numpy(), dtype=np.float64, copy=True)
         values[~np.isfinite(values)] = np.nan
         if fitting:
             medians = []

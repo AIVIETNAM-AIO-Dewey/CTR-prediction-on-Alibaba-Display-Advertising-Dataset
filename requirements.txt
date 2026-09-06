@@ -5,6 +5,7 @@ numpy>=1.24.0
 pandas>=2.0.0
 polars>=0.20.0          # Xử lý dữ liệu lớn (như raw_sample.csv ~1GB) với tốc độ cao & tiết kiệm RAM
 pyarrow>=14.0.0         # Tối ưu đọc/ghi định dạng Parquet/Feather
+duckdb>=1.0.0           # Disk-backed SQL/spill execution for full-data feature engineering
 scipy>=1.10.0
 tqdm>=4.65.0            # Progress bar
 joblib>=1.3.0           # Lưu/tải model & xử lý song song
