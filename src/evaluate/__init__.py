@@ -6,6 +6,7 @@ from src.evaluate.evaluator import (
     evaluate_artifact,
     evaluate_predictions,
     evaluate_suite,
+    load_evaluation_result_models,
     load_evaluation_results,
     write_evaluation_outputs,
 )
@@ -26,4 +27,5 @@ __all__ = [
     "evaluate_suite",
     "write_evaluation_outputs",
     "load_evaluation_results",
+    "load_evaluation_result_models",
 ]

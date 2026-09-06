@@ -211,6 +211,7 @@ def fit_from_config(
     sample_size: Optional[int] = None,
     sample_fraction: Optional[float] = None,
     random_seed: Optional[int] = None,
+    run_signature: Optional[str] = None,
     save_artifact: bool = True,
     write_manifest: bool = True,
     dataset: Optional[CTRDataset] = None,
@@ -228,6 +229,7 @@ def fit_from_config(
         sample_size: Override for `data.sample_size` (0 or None -> full dataset).
         sample_fraction: Override for `data.sample_fraction`.
         random_seed: Override for `data.random_seed`.
+        run_signature: Optional identity used to validate resumable artifacts.
         save_artifact: Whether to serialize the fitted model to `models_dir`.
         write_manifest: Whether to write the JSON training manifest.
         dataset: Pre-loaded dataset, to fit several configs without re-reading parquet.
@@ -319,6 +321,7 @@ def fit_from_config(
         "artifact_path": str(artifact_path),
         "use_fe": bool(use_fe),
         "random_seed": seed,
+        "run_signature": run_signature,
         "train_rows": int(len(dataset.X_train)),
         "val_rows": int(len(dataset.X_val)) if dataset.X_val is not None else 0,
         "test_rows": int(len(dataset.X_test)) if dataset.X_test is not None else 0,

@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,13 @@ from src.evaluate.evaluator import (
     evaluate_predictions,
     write_evaluation_outputs,
 )
+from src.evaluate.experiment_runner import (
+    load_compatible_results,
+    load_valid_checkpoint,
+    release_iteration_state,
+    validate_engineered_cache,
+)
+from src.evaluate.signatures import config_fingerprint, partition_fingerprint
 from src.evaluate.metrics import (
     compute_probability_metrics,
     compute_threshold_metrics,
@@ -90,7 +98,27 @@ class EvaluationOutputTests(unittest.TestCase):
             self.assertEqual(len(list((root / "plots").glob("*.png"))), 6)
             payload = json.loads(paths["json"].read_text(encoding="utf-8"))
             self.assertEqual(payload["models"][0]["model_key"], "synthetic")
+            self.assertEqual(payload["models"][0]["rank"], 1)
+            self.assertEqual(payload["best_model"], "synthetic")
+            self.assertEqual(payload["ranking"][0]["model"], "synthetic")
             self.assertTrue(payload["metadata"]["test"])
+
+            result.metadata["run_signature"] = "sig"
+            write_evaluation_outputs(
+                [result], root / "experiments", root / "plots", metadata={"test": True}
+            )
+            compatible = load_compatible_results(
+                root / "experiments" / "model_evaluation_results.json",
+                {"synthetic": "sig"},
+            )
+            self.assertIn("synthetic", compatible)
+            self.assertEqual(
+                load_compatible_results(
+                    root / "experiments" / "model_evaluation_results.json",
+                    {"synthetic": "stale"},
+                ),
+                {},
+            )
 
 
 class FeatureEngineeringAndArtifactTests(unittest.TestCase):
@@ -157,9 +185,117 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             self.assertEqual(result.validation.n_rows, 4)
             self.assertEqual(result.test.n_rows, 4)
 
-    def test_catboost_gpu_device_is_a_persisted_wrapper_option(self):
-        model = CatBoostCTRModel(task_type="GPU", devices="0:1")
-        self.assertEqual(model.devices, "0:1")
+    def test_catboost_gpu_device_reaches_estimator_constructor(self):
+        model = CatBoostCTRModel(task_type="GPU", devices="0:1", verbose=False)
+        with patch("src.models.catboost_model.cb.CatBoostClassifier") as constructor:
+            constructor.return_value.get_best_iteration.return_value = 0
+            model.fit(pl.DataFrame({"feature": [0.0, 1.0, 2.0, 3.0]}), [0, 0, 1, 1])
+        self.assertEqual(constructor.call_args.kwargs["devices"], "0:1")
+
+    def test_memory_bounded_feature_engineering_matches_in_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            partitions = [self._partition(8), self._partition(4, 8), self._partition(4, 12)]
+            paths = []
+            for name, frame in zip(("train", "val", "test"), partitions):
+                path = root / f"{name}.parquet"
+                frame.write_parquet(path)
+                paths.append(path)
+
+            config = {"feature_engineering": {"target_encoding": {"n_folds": 2}}}
+            expected = CTRFeatureEngineer(config).fit_transform(*partitions)
+            output = root / "engineered"
+            CTRFeatureEngineer(config).fit_transform_partitioned_paths(*paths, output)
+            actual = [pl.read_parquet(output / f"{name}_fe.parquet") for name in ("train", "val", "test")]
+            self.assertTrue(all(expected_frame.equals(actual_frame) for expected_frame, actual_frame in zip(expected, actual)))
+
+    def test_memory_bounded_feature_engineering_rejects_non_chronological_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = self._partition(4, 10)
+            val = self._partition(4, 0)
+            test = self._partition(4, 20)
+            paths = []
+            for name, frame in zip(("train", "val", "test"), (train, val, test)):
+                path = root / f"{name}.parquet"
+                frame.write_parquet(path)
+                paths.append(path)
+            with self.assertRaisesRegex(ValueError, "chronological"):
+                CTRFeatureEngineer().fit_transform_partitioned_paths(*paths, root / "engineered")
+
+    def test_engineered_cache_checks_actual_files_and_config_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "feature.yaml"
+            config_path.write_text("feature_engineering:\n  target_encoding:\n    n_folds: 2\n", encoding="utf-8")
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            for split, rows in (("train", 4), ("val", 2), ("test", 2)):
+                frame = self._partition(rows)
+                frame.write_parquet(input_dir / f"{split}.parquet")
+                frame.write_parquet(output_dir / f"{split}_fe.parquet")
+            output_fingerprint = partition_fingerprint(output_dir, suffix="_fe")
+            metadata = {
+                "num_train_rows": 4,
+                "num_val_rows": 2,
+                "num_test_rows": 2,
+                "columns": list(output_fingerprint["train"]["schema"]),
+                "schema": output_fingerprint["train"]["schema"],
+                "input_fingerprint": partition_fingerprint(input_dir),
+                "config_fingerprint": config_fingerprint(config_path),
+                "memory_bounded": True,
+                "pipeline_revision": "rev",
+            }
+            (output_dir / "feature_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            valid, _, _ = validate_engineered_cache(input_dir, output_dir, config_path, "rev")
+            self.assertTrue(valid)
+            self._partition(1).write_parquet(output_dir / "val_fe.parquet")
+            valid, _, _ = validate_engineered_cache(input_dir, output_dir, config_path, "rev")
+            self.assertFalse(valid)
+
+    def test_checkpoint_requires_signature_and_exact_feature_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = pd.DataFrame({"price": [1, 2, 3, 4], "clk": [0, 0, 1, 1]})
+            model = LogisticRegressionModel(numeric_features=["price"], max_iter=100)
+            model.fit(train[["price"]], train["clk"])
+            artifact = root / "model.joblib"
+            model.save(artifact)
+            manifest = root / "manifest.json"
+            base = {
+                "model": "logistic_regression",
+                "run_signature": "sig",
+                "train_rows": 4,
+                "val_rows": 2,
+                "test_rows": 2,
+                "n_features": 1,
+                "feature_names": ["price"],
+            }
+            manifest.write_text(json.dumps(base), encoding="utf-8")
+            loaded = load_valid_checkpoint(
+                "logistic_regression", artifact, manifest, LogisticRegressionModel.load,
+                "sig", {"train": 4, "val": 2, "test": 2},
+            )
+            self.assertIsNotNone(loaded)
+            base["run_signature"] = "stale"
+            manifest.write_text(json.dumps(base), encoding="utf-8")
+            self.assertIsNone(load_valid_checkpoint(
+                "logistic_regression", artifact, manifest, LogisticRegressionModel.load,
+                "sig", {"train": 4, "val": 2, "test": 2},
+            ))
+
+    def test_release_iteration_state_clears_large_locals(self):
+        namespace = {name: object() for name in ("run", "model", "X_val", "X_test", "y_val", "y_test", "p_val", "p_test")}
+        release_iteration_state(namespace)
+        self.assertTrue(all(namespace[name] is None for name in namespace))
+
+    def test_notebook_does_not_embed_token_in_clone_url(self):
+        notebook = Path(__file__).parents[1] / "notebook" / "model_evaluation_experiments.ipynb"
+        source = notebook.read_text(encoding="utf-8")
+        self.assertNotIn('REPO_URL.replace("https://", f"https://{token}@")', source)
+        self.assertNotIn("https://{token}@", source)
 
 
 if __name__ == "__main__":

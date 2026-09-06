@@ -6,6 +6,7 @@ encodings, cross features, and out-of-fold smoothed Bayesian target encoding.
 """
 
 from pathlib import Path
+import gc
 from typing import Any, Dict, List, Optional, Union
 import logging
 import math
@@ -200,27 +201,250 @@ class CTRFeatureEngineer:
     def add_target_encoding_oof(self, train_df: pl.DataFrame) -> pl.DataFrame:
         """Compute out-of-fold target encodings for train so a row's label never leaks into its own encoding."""
         logger.info(f"Computing {self.n_folds}-fold OOF target encodings on train partition...")
-        n = train_df.height
+        if self.n_folds < 2:
+            raise ValueError("n_folds must be at least 2 for out-of-fold target encoding.")
+
+        # Keep the established RandomState assignment for reproducibility, but
+        # store only a compact fold column and never materialize n_folds filtered
+        # copies of the training frame.
         rng = np.random.RandomState(self.random_seed)
-        fold_ids = rng.randint(0, self.n_folds, size=n)
-        train_df = train_df.with_columns(pl.Series("_fold", fold_ids, dtype=pl.Int32))
-
-        encoded_parts = []
-        for fold in range(self.n_folds):
-            fold_fit = train_df.filter(pl.col("_fold") != fold)
-            fold_holdout = train_df.filter(pl.col("_fold") == fold)
-            fold_prior = float(fold_fit.select(pl.col("clk").mean()).item())
-
-            for col in self.target_encode_cols:
-                te_col = f"{col}_te"
-                stats = self._fit_te_lookup(fold_fit, col, fold_prior)
-                fold_holdout = fold_holdout.join(stats, on=col, how="left").with_columns(
-                    pl.col(te_col).fill_null(fold_prior)
+        fold_ids = rng.randint(0, self.n_folds, size=train_df.height).astype(np.int8)
+        train_df = train_df.with_columns(
+            pl.Series("_fold", fold_ids, dtype=pl.Int8)
+        )
+        fold_totals = train_df.group_by("_fold").agg(
+            [pl.col("clk").sum().alias("_fold_pos_total"), pl.len().alias("_fold_count_total")]
+        )
+        result = train_df
+        for col in self.target_encode_cols:
+            te_col = f"{col}_te"
+            global_stats = train_df.group_by(col).agg(
+                [pl.col("clk").sum().alias("_global_pos"), pl.len().alias("_global_count")]
+            )
+            fold_stats = train_df.group_by([col, "_fold"]).agg(
+                [pl.col("clk").sum().alias("_heldout_pos"), pl.len().alias("_heldout_count")]
+            )
+            denominator = pl.col("_global_count") - pl.col("_heldout_count")
+            prior_denominator = pl.col("_fold_count_total") - pl.col("_heldout_count")
+            fold_prior = pl.when(prior_denominator > 0).then(
+                (pl.col("_fold_pos_total") - pl.col("_heldout_pos")).truediv(prior_denominator)
+            ).otherwise(float(self.global_ctr or 0.0))
+            result = (
+                result.join(global_stats.select([col, "_global_pos", "_global_count"]), on=col, how="left")
+                .join(fold_stats, on=[col, "_fold"], how="left")
+                .join(fold_totals, on="_fold", how="left")
+                .with_columns(
+                    pl.when(denominator > 0)
+                    .then(
+                        (
+                            (pl.col("_global_pos") - pl.col("_heldout_pos"))
+                            + self.smoothing * fold_prior
+                        ).truediv(denominator + self.smoothing)
+                    )
+                    .otherwise(fold_prior)
+                    .cast(pl.Float32)
+                    .alias(te_col)
                 )
-            encoded_parts.append(fold_holdout)
+                .drop(
+                    [
+                        "_global_pos",
+                        "_global_count",
+                        "_heldout_pos",
+                        "_heldout_count",
+                        "_fold_pos_total",
+                        "_fold_count_total",
+                    ]
+                )
+            )
+        return result.drop("_fold")
 
-        result = pl.concat(encoded_parts).drop("_fold")
-        return result
+    def fit_transform_partitioned(
+        self,
+        train_df: pl.DataFrame,
+        val_df: pl.DataFrame,
+        test_df: pl.DataFrame,
+    ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+        """Feature-engineer chronological partitions without concatenating all rows.
+
+        This keeps only the current partition plus train-fitted lookup tables in
+        memory.  The caller must validate that the partitions are chronological;
+        exposure counters intentionally carry state from one partition to the next.
+        """
+        exposure_state: dict[str, pl.DataFrame] = {}
+
+        def transform_exposure(frame: pl.DataFrame) -> pl.DataFrame:
+            frame = frame.sort("time_stamp")
+            for keys, name in (
+                (["user", "adgroup_id"], "user_adgroup_exposure_seq"),
+                (["user", "cate_id"], "user_cate_exposure_seq"),
+            ):
+                state = exposure_state.get(name)
+                local = (pl.col("time_stamp").cum_count().over(keys) - 1).cast(pl.Int64)
+                if state is None:
+                    frame = frame.with_columns(local.cast(pl.Int32).alias(name))
+                else:
+                    state_col = f"_{name}_prior"
+                    frame = (
+                        frame.join(state.rename({"_count": state_col}), on=keys, how="left")
+                        .with_columns(
+                            (local + pl.col(state_col).fill_null(0))
+                            .cast(pl.Int32)
+                            .alias(name)
+                        )
+                        .drop(state_col)
+                    )
+                counts = frame.group_by(keys).agg(pl.len().alias("_count"))
+                if state is None:
+                    exposure_state[name] = counts
+                else:
+                    exposure_state[name] = (
+                        pl.concat([state, counts], how="vertical_relaxed")
+                        .group_by(keys)
+                        .agg(pl.col("_count").sum())
+                    )
+            return frame
+
+        train = transform_exposure(train_df)
+        train = self.add_cross_features(self.add_cyclical_time_features(train))
+        self.fit_price_stats(train)
+        train = self.add_price_features(train)
+        self.fit_target_encoding(train)
+        train = self.add_target_encoding_oof(train)
+
+        val = transform_exposure(val_df)
+        val = self.add_price_features(
+            self.add_cross_features(self.add_cyclical_time_features(val))
+        )
+        val = self.transform_target_encoding(val)
+
+        test = transform_exposure(test_df)
+        test = self.add_price_features(
+            self.add_cross_features(self.add_cyclical_time_features(test))
+        )
+        test = self.transform_target_encoding(test)
+        return train, val, test
+
+    def fit_transform_partitioned_paths(
+        self,
+        train_path: str | Path,
+        val_path: str | Path,
+        test_path: str | Path,
+        output_dir: str | Path,
+    ) -> Dict[str, Any]:
+        """Run feature engineering one parquet partition at a time.
+
+        The train frame is released before validation is loaded and validation is
+        released before test is loaded.  This is the entry point used by Kaggle;
+        the in-memory methods above remain available for small local workflows.
+        """
+        output_root = Path(output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        exposure_state: dict[str, pl.DataFrame] = {}
+        previous_max_time: Any = None
+        counts: Dict[str, int] = {}
+        feature_columns: Optional[List[str]] = None
+
+        def transform_exposure(frame: pl.DataFrame) -> pl.DataFrame:
+            nonlocal previous_max_time
+            if frame.is_empty():
+                raise ValueError("Feature-engineering partitions must not be empty.")
+            current_min, current_max = frame.select(
+                [
+                    pl.col("time_stamp").min().alias("_min_time"),
+                    pl.col("time_stamp").max().alias("_max_time"),
+                ]
+            ).row(0)
+            if previous_max_time is not None and current_min < previous_max_time:
+                raise ValueError(
+                    "Expected chronological partitions train -> val -> test; "
+                    f"found {current_min!r} after {previous_max_time!r}."
+                )
+            previous_max_time = current_max
+            frame = frame.sort("time_stamp")
+            for keys, name in (
+                (["user", "adgroup_id"], "user_adgroup_exposure_seq"),
+                (["user", "cate_id"], "user_cate_exposure_seq"),
+            ):
+                state = exposure_state.get(name)
+                local = (pl.col("time_stamp").cum_count().over(keys) - 1).cast(pl.Int64)
+                if state is None:
+                    frame = frame.with_columns(local.cast(pl.Int32).alias(name))
+                else:
+                    state_col = f"_{name}_prior"
+                    frame = (
+                        frame.join(state.rename({"_count": state_col}), on=keys, how="left")
+                        .with_columns(
+                            (local + pl.col(state_col).fill_null(0))
+                            .cast(pl.Int32)
+                            .alias(name)
+                        )
+                        .drop(state_col)
+                    )
+                current_counts = frame.group_by(keys).agg(pl.len().alias("_count"))
+                if state is None:
+                    exposure_state[name] = current_counts
+                else:
+                    exposure_state[name] = (
+                        pl.concat([state, current_counts], how="vertical_relaxed")
+                        .group_by(keys)
+                        .agg(pl.col("_count").sum())
+                    )
+            return frame
+
+        def write_partition(name: str, frame: pl.DataFrame) -> None:
+            nonlocal feature_columns
+            if feature_columns is None:
+                feature_columns = list(frame.columns)
+            elif list(frame.columns) != feature_columns:
+                raise ValueError(f"Feature schema changed in {name} partition.")
+            destination = output_root / f"{name}_fe.parquet"
+            temporary = output_root / f".{name}_fe.parquet.tmp"
+            if temporary.exists():
+                temporary.unlink()
+            frame.write_parquet(temporary, compression="snappy")
+            temporary.replace(destination)
+            counts[name] = frame.height
+
+        train = transform_exposure(pl.read_parquet(train_path))
+        train = self.add_cross_features(self.add_cyclical_time_features(train))
+        self.fit_price_stats(train)
+        train = self.add_price_features(train)
+        self.fit_target_encoding(train)
+        train = self.add_target_encoding_oof(train)
+        write_partition("train", train)
+        del train
+        gc.collect()
+
+        val = transform_exposure(pl.read_parquet(val_path))
+        val = self.add_price_features(
+            self.add_cross_features(self.add_cyclical_time_features(val))
+        )
+        val = self.transform_target_encoding(val)
+        write_partition("val", val)
+        del val
+        gc.collect()
+
+        test = transform_exposure(pl.read_parquet(test_path))
+        test = self.add_price_features(
+            self.add_cross_features(self.add_cyclical_time_features(test))
+        )
+        test = self.transform_target_encoding(test)
+        write_partition("test", test)
+        del test
+        gc.collect()
+
+        return {
+            "num_train_rows": counts["train"],
+            "num_val_rows": counts["val"],
+            "num_test_rows": counts["test"],
+            "columns": feature_columns or [],
+            "target_encode_columns": list(self.target_encode_cols),
+            "target_encoding_smoothing": self.smoothing,
+            "target_encoding_n_folds": self.n_folds,
+            "target_encoding_fold_strategy": "random_state_aggregate",
+            "global_train_ctr": self.global_ctr,
+            "global_median_price": self.global_median_price,
+        }
 
     # ------------------------------------------------------------------ #
     # Full Pipeline Orchestration

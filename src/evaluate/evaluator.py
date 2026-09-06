@@ -56,6 +56,24 @@ class EvaluationResult:
     selected_threshold: float
     curves: Dict[str, List[float]] = field(default_factory=dict)
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "EvaluationResult":
+        return cls(
+            split=str(payload["split"]),
+            n_rows=int(payload["n_rows"]),
+            positive_rate=float(payload["positive_rate"]),
+            probability_metrics={
+                str(key): float(value)
+                for key, value in dict(payload["probability_metrics"]).items()
+            },
+            threshold_metrics=[dict(row) for row in payload["threshold_metrics"]],
+            selected_threshold=float(payload["selected_threshold"]),
+            curves={
+                str(key): [float(value) for value in values]
+                for key, values in dict(payload.get("curves", {})).items()
+            },
+        )
+
 
 @dataclass
 class ModelEvaluationResult:
@@ -68,6 +86,17 @@ class ModelEvaluationResult:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ModelEvaluationResult":
+        return cls(
+            model_key=str(payload["model_key"]),
+            artifact_path=str(payload.get("artifact_path", "")),
+            validation=EvaluationResult.from_dict(payload["validation"]),
+            test=EvaluationResult.from_dict(payload["test"]),
+            manifest_path=payload.get("manifest_path"),
+            metadata=dict(payload.get("metadata", {})),
+        )
 
 
 def evaluate_predictions(
@@ -236,14 +265,37 @@ def write_evaluation_outputs(
     from src.evaluate.plot_results import save_comparison_plots
 
     plot_paths = save_comparison_plots(results, plots)
+    ranked = sorted(
+        results,
+        key=lambda result: (
+            -result.validation.probability_metrics["roc_auc"],
+            result.validation.probability_metrics["log_loss"],
+        ),
+    )
+    rank_by_model = {result.model_key: rank for rank, result in enumerate(ranked, start=1)}
     payload = {
         "metadata": dict(metadata or {}),
-        "models": [result.to_dict() for result in results],
+        "models": [
+            {**result.to_dict(), "rank": rank_by_model[result.model_key]}
+            for result in results
+        ],
+        "ranking": [
+            {
+                "rank": rank,
+                "model": result.model_key,
+                "validation_roc_auc": result.validation.probability_metrics["roc_auc"],
+                "validation_log_loss": result.validation.probability_metrics["log_loss"],
+            }
+            for rank, result in enumerate(ranked, start=1)
+        ],
+        "best_model": ranked[0].model_key,
         "plot_paths": [str(path) for path in plot_paths],
     }
     json_path = experiments / "model_evaluation_results.json"
-    with json_path.open("w", encoding="utf-8") as handle:
+    json_tmp = experiments / ".model_evaluation_results.json.tmp"
+    with json_tmp.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+    json_tmp.replace(json_path)
 
     metric_rows: List[Dict[str, Any]] = []
     threshold_rows: List[Dict[str, Any]] = []
@@ -253,6 +305,7 @@ def write_evaluation_outputs(
                 metric_rows.append(
                     {
                         "model": result.model_key,
+                        "rank": rank_by_model[result.model_key],
                         "split": split_result.split,
                         "n_rows": split_result.n_rows,
                         "positive_rate": split_result.positive_rate,
@@ -265,6 +318,7 @@ def write_evaluation_outputs(
                 threshold_rows.append(
                     {
                         "model": result.model_key,
+                        "rank": rank_by_model[result.model_key],
                         "split": split_result.split,
                         "n_rows": split_result.n_rows,
                         "positive_rate": split_result.positive_rate,
@@ -273,16 +327,20 @@ def write_evaluation_outputs(
                 )
 
     metrics_path = experiments / "model_metrics.csv"
-    with metrics_path.open("w", newline="", encoding="utf-8") as handle:
+    metrics_tmp = experiments / ".model_metrics.csv.tmp"
+    with metrics_tmp.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(metric_rows[0]))
         writer.writeheader()
         writer.writerows(metric_rows)
+    metrics_tmp.replace(metrics_path)
 
     thresholds_path = experiments / "threshold_metrics.csv"
-    with thresholds_path.open("w", newline="", encoding="utf-8") as handle:
+    thresholds_tmp = experiments / ".threshold_metrics.csv.tmp"
+    with thresholds_tmp.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(threshold_rows[0]))
         writer.writeheader()
         writer.writerows(threshold_rows)
+    thresholds_tmp.replace(thresholds_path)
     return {
         "json": json_path,
         "metrics_csv": metrics_path,
@@ -295,3 +353,9 @@ def load_evaluation_results(path: str | Path) -> Dict[str, Any]:
     """Load a previously written JSON result file for notebook resume/reporting."""
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_evaluation_result_models(path: str | Path) -> List[ModelEvaluationResult]:
+    """Load serialized model results for notebook resume/merge."""
+    payload = load_evaluation_results(path)
+    return [ModelEvaluationResult.from_dict(item) for item in payload.get("models", [])]
