@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import polars as pl
 
@@ -132,3 +132,38 @@ def load_ctr_dataset(
         categorical_features=cats,
         numeric_features=nums,
     )
+
+
+def load_ctr_partition(
+    processed_dir: str,
+    split: str,
+    feature_names: Sequence[str],
+    target_col: str = "clk",
+    use_fe: bool = True,
+    sample_size: Optional[int] = None,
+    sample_fraction: Optional[float] = None,
+    random_seed: int = 42,
+) -> Tuple[pl.DataFrame, pl.Series]:
+    """Load only the columns needed to evaluate one persisted model."""
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"split must be one of train, val, test; got {split!r}.")
+    if sample_size is not None and sample_size <= 0:
+        sample_size = None
+    if sample_fraction is not None and not 0 < sample_fraction <= 1:
+        raise ValueError("sample_fraction must be in the interval (0, 1].")
+    if sample_size is not None and sample_fraction is not None:
+        raise ValueError("Use either sample_size or sample_fraction, not both.")
+
+    suffix = "_fe" if use_fe else ""
+    path = Path(processed_dir) / f"{split}{suffix}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{split} partition not found: {path}")
+    requested = list(dict.fromkeys([target_col, *feature_names]))
+    schema = pl.read_parquet_schema(path)
+    missing = [column for column in requested if column not in schema]
+    if missing:
+        raise ValueError(f"{split} partition is missing required column(s): {missing}")
+
+    frame = pl.scan_parquet(path).select(requested).collect()
+    frame = _sample(frame, sample_size, sample_fraction, random_seed)
+    return frame.select(list(feature_names)), frame.get_column(target_col)

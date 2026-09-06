@@ -40,7 +40,8 @@ CTR_Prediction/
 ├── notebook/
 │   ├── EDA.ipynb                       # Exploratory Data Analysis and raw data distributions
 │   ├── feature_analysis.ipynb          # Correlation diagnostics, Cramer's V, Mutual Information, and Decision Matrix
-│   └── tree_models_training.ipynb      # Kaggle/local driver: fits all three tree models and verifies the BaseCTRModel contract
+│   ├── tree_models_training.ipynb      # Kaggle/local driver: fits the tree models and verifies artifacts
+│   └── model_evaluation_experiments.ipynb # Kaggle 2xT4 full benchmark and evaluation driver
 │
 ├── src/
 │   ├── __init__.py
@@ -56,7 +57,8 @@ CTR_Prediction/
 │   │   └── run_feature_engineering.py  # CLI entry point for feature engineering
 │   ├── models/                         # Model wrappers and per-model fitting entry points
 │   │   ├── __init__.py                 # Lazy (PEP 562) re-exports: importing one model never loads the other's backend
-│   │   ├── base_model.py               # BaseCTRModel abstract interface and shared benchmark metrics
+│   │   ├── lightgbm_model.py            # LightGBM wrapper with native categorical mapping
+│   │   ├── logistic_regression_model.py # Sparse Logistic Regression baseline
 │   │   ├── catboost_model.py           # CatBoost wrapper (ordered target statistics on native categoricals)
 │   │   ├── xgboost_model.py            # XGBoost wrapper (histogram trees with native categorical splits)
 │   │   ├── random_forest_model.py      # Random Forest wrapper (bagging baseline, ordinal-encoded categoricals)
@@ -65,7 +67,7 @@ CTR_Prediction/
 │   │   ├── run_catboost.py             # CLI entry point: fit CatBoost only
 │   │   ├── run_xgboost.py              # CLI entry point: fit XGBoost only
 │   │   └── run_random_forest.py        # CLI entry point: fit Random Forest only
-│   └── evaluate/                       # Model evaluation, metric calculation, and SHAP diagnostics (Upcoming)
+│   └── evaluate/                       # Shared metrics, artifact evaluation, plots, and CLI
 │
 ├── models/                             # Serialized model artifacts (.joblib, .json)
 ├── experiments/                        # Experiment tracking logs and Optuna hyperparameter studies
@@ -109,12 +111,12 @@ CTR_Prediction/
    - Out-of-fold smoothed Bayesian target encoding for high-cardinality IDs (`cate_id`, `brand`, `customer`, `pid`), fitted exclusively on train and frozen onto val/test to prevent leakage.
 
 5. Tree-Based Model Suite (`src/models/`):
-   - `BaseCTRModel` abstract interface standardizing `fit()`, `predict_proba()`, `predict()`, `evaluate()`, `save()`, and `load()`.
+   - Shared wrapper contract standardizing `fit()`, `predict_proba()`, `predict()`, `save()`, and `load()`.
    - Benchmark metrics on every partition: ROC-AUC, LogLoss, PR-AUC (Average Precision), and Brier score.
    - CatBoost wrapper: ordered boosting with native high-cardinality categorical handling via target statistics and automatic feature combinations.
    - XGBoost wrapper: histogram trees with native categorical splits (`enable_categorical`), using category dictionaries fitted on train only and frozen onto val/test.
    - Random Forest wrapper: scikit-learn bagging baseline over ordinal-encoded categoricals, dictionaries fitted on train only, unseen levels mapped to a single out-of-vocabulary code.
-   - One config and one entry point per model (`catboost`, `xgboost`, `random_forest`), so a training run never starts another model as a side effect.
+   - One config and one entry point per model (`logistic_regression`, `lightgbm`, `catboost`, `xgboost`, `random_forest`), so a training run never starts another model as a side effect.
    - Feature scoping driven by each model's own config, dropping `nonclk`, `user`, `adgroup_id`, `time_stamp`, and the collinear `cms_segid` per the Feature Decision Matrix. XGBoost additionally drops `customer` / `brand`, which it memorizes as raw IDs; CatBoost keeps them because ordered target statistics already regularize them.
    - Fitting stops at the artifact: the runners persist `models/<model>_fe.joblib` plus a training manifest and compute no metrics. Per CONTRIBUTING.md this is Task 3; metrics and plots are Task 4 (`src/evaluate/`) and hyperparameter search is Task 5 (`experiments/tune_optuna.py`).
 
@@ -171,7 +173,7 @@ Reads `train.parquet` / `val.parquet` / `test.parquet` from `data/processed/` an
 python -m src.features.run_feature_engineering --config configs/feature_engineering.yaml
 ```
 
-### 5. Fitting the Tree Models (CatBoost, XGBoost, Random Forest)
+### 5. Fitting the Model Suite (Logistic Regression, LightGBM, CatBoost, XGBoost, Random Forest)
 Each model has its own config and its own entry point, so one command trains exactly one model.
 Both read `train_fe.parquet` / `val_fe.parquet` / `test_fe.parquet`, train with early stopping on
 the validation partition, and write `models/<model>_fe.joblib` plus a training manifest to
@@ -205,7 +207,7 @@ instead. CatBoost keeps all three - ordered target statistics already regularize
 ### 6. Fitting on Kaggle
 `notebook/tree_models_training.ipynb` is the same fitting step packaged for a Kaggle kernel,
 which is easier than a laptop for the full ~20M-row engineered partition. It clones this repo,
-fits all three models through `fit_from_config` (the same function the CLI runners call), verifies the
+fits the tree models through `fit_from_config` (the same function the CLI runners call), verifies the
 `save()` / `load()` / `predict_proba()` contract, and stops there. It never reads the validation
 or test labels, so it computes no metrics.
 
@@ -222,21 +224,28 @@ code and configs only, so on Kaggle you must:
 jupyter lab notebook/tree_models_training.ipynb   # runs locally too
 ```
 
-### 7. Evaluating the Models (Task 4 - not in this branch)
-Metrics, comparison tables and plots belong to `src/evaluate/` per CONTRIBUTING.md. That module
-consumes the artifacts produced above:
+### 7. Evaluating the Models (Task 4)
+The evaluation suite loads persisted artifacts and evaluates all five models without duplicating
+preprocessing or wrapper-specific metric code:
 
-```python
-from src.models.train import get_model_class, load_config, load_dataset_from_config
+    python -m src.evaluate.run_evaluation --sample-size 200000
 
-cfg = load_config("configs/catboost.yaml")
-model = get_model_class("catboost").load("models/catboost_fe.joblib")
-dataset = load_dataset_from_config(cfg, sample_size=200_000)   # same feature scope as training
-y_prob = model.predict_proba(dataset.X_test)
-```
+It writes probability metrics (ROC-AUC, LogLoss, PR-AUC, and Brier score), threshold reports,
+validation-selected F1 thresholds, and ROC / Precision-Recall / calibration plots. Full evaluation
+uses --sample-size 0 and expects train_fe.parquet, val_fe.parquet, and test_fe.parquet.
 
-`experiments/<model>_run.json` records how each artifact was produced (sampling, seed, feature
-lists, dropped columns, best iteration) so evaluation results stay traceable to a training run.
+For the full Kaggle workflow, attach the plain train.parquet, val.parquet, and test.parquet
+partitions as input and run notebook/model_evaluation_experiments.ipynb. The notebook builds the
+engineered partitions in writable Kaggle storage, trains models sequentially, resumes valid
+full-data checkpoints, and writes:
+
+- experiments/model_evaluation_results.json
+- experiments/model_metrics.csv
+- experiments/threshold_metrics.csv
+- outputs/model_evaluation/*.png
+
+The validation split selects the comparison model and threshold; test metrics are reported only
+after those choices are frozen. Generated artifacts are not pushed automatically.
 
 ## 8. Team Contribution Guidelines
 

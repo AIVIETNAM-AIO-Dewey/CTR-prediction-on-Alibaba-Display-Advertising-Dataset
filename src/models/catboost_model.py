@@ -54,6 +54,7 @@ class CatBoostCTRModel:
         random_state: int = 42,
         thread_count: int = -1,
         task_type: str = "CPU",
+        devices: Optional[str] = None,
         verbose: int = 100,
         config: Optional[Dict[str, Any]] = None,
     ):
@@ -106,6 +107,7 @@ class CatBoostCTRModel:
         self.random_state = random_state
         self.thread_count = thread_count
         self.task_type = task_type
+        self.devices = devices
         self.verbose = verbose
 
         self.estimator: Optional[cb.CatBoostClassifier] = None
@@ -267,6 +269,8 @@ class CatBoostCTRModel:
             "verbose": self.verbose,
             "allow_writing_files": False,
         }
+        if self.task_type == "GPU" and self.devices:
+            params["devices"] = self.devices
 
         # `subsample` is only valid for Bernoulli / MVS / Poisson bootstrap schemes
         if self.bootstrap_type in ("Bernoulli", "MVS", "Poisson"):
