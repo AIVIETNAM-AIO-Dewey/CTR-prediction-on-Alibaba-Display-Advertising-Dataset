@@ -266,6 +266,7 @@ class DatasetAndRunnerTests(unittest.TestCase):
             )
             self.assertIsNone(result.dataset)
             self.assertEqual(result.manifest["train_rows"], 8)
+            self.assertEqual(result.manifest["rows_seen"], 8)
             self.assertEqual(result.manifest["fit_mode"], "streaming_sgd")
             self.assertTrue(np.isfinite(result.model.predict_proba(batches[0][0])).all())
 

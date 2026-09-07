@@ -79,6 +79,7 @@ class LogisticRegressionModel:
         self.estimator: Optional[Union[LogisticRegression, SGDClassifier]] = None
         self.transformed_feature_names_: List[str] = []
         self.stream_imputation_method_ = None
+        self.stream_rows_seen_ = 0
         self.best_iteration_ = 0
         self.is_fitted = False
 
@@ -273,6 +274,7 @@ class LogisticRegressionModel:
                     f"Streaming epoch consumed {epoch_rows} rows; expected {expected_rows}."
                 )
         self.best_iteration_ = epochs
+        self.stream_rows_seen_ = rows_seen
         self.is_fitted = True
         logger.info(
             "[%s] streaming SGD complete: rows=%d epochs=%d batch_size=%d features=%d",

@@ -414,6 +414,7 @@ def fit_from_config(
         "stream_batch_size": params.get("stream_batch_size") if streaming_lr else None,
         "stream_epochs": params.get("stream_epochs") if streaming_lr else None,
         "stream_imputation_method": getattr(model, "stream_imputation_method_", None),
+        "rows_seen": getattr(model, "stream_rows_seen_", None) if streaming_lr else None,
         "dropped_features": list(config.get("features", {}).get("drop_features") or []),
         "early_stopping_rounds": fit_kwargs.get("early_stopping_rounds"),
         "best_iteration": int(getattr(model, "best_iteration_", 0) or 0),
