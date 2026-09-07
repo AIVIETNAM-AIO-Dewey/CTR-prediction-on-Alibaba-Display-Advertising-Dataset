@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
+import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 
 
 @dataclass
@@ -193,3 +195,85 @@ def load_ctr_partition(
     frame = pl.scan_parquet(path).select(requested).collect()
     frame = _sample(frame, sample_size, sample_fraction, random_seed)
     return frame.select(list(feature_names)), frame.get_column(target_col)
+
+
+def ctr_partition_path(
+    processed_dir: str | Path, split: str, *, use_fe: bool = True
+) -> Path:
+    """Return the parquet path for one partition without materialising it."""
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"split must be one of train, val, test; got {split!r}.")
+    suffix = "_fe" if use_fe else ""
+    path = Path(processed_dir) / f"{split}{suffix}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{split} partition not found: {path}")
+    return path
+
+
+def ctr_partition_rows(
+    processed_dir: str | Path, split: str, *, use_fe: bool = True
+) -> int:
+    """Read a partition row count from parquet metadata without loading rows."""
+    path = ctr_partition_path(processed_dir, split, use_fe=use_fe)
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def inspect_ctr_features(
+    processed_dir: str | Path,
+    *,
+    target_col: str = "clk",
+    exclude_cols: Optional[Sequence[str]] = None,
+    categorical_cols: Optional[Sequence[str]] = None,
+    numeric_cols: Optional[Sequence[str]] = None,
+    use_fe: bool = True,
+) -> tuple[List[str], List[str], List[str]]:
+    """Inspect feature names/types from train parquet without reading the data."""
+    path = ctr_partition_path(processed_dir, "train", use_fe=use_fe)
+    schema = pl.read_parquet_schema(path)
+    excluded = set(exclude_cols or []) | {target_col}
+    features = [name for name in schema if name not in excluded]
+    if not features:
+        raise ValueError("No model features remain after applying exclude_cols.")
+    configured_cats = [name for name in (categorical_cols or []) if name in features]
+    configured_nums = [
+        name for name in (numeric_cols or []) if name in features and name not in configured_cats
+    ]
+    cats = list(configured_cats)
+    nums = list(configured_nums)
+    for name in features:
+        if name in cats or name in nums:
+            continue
+        if schema[name] in (pl.String, pl.Categorical, pl.Enum, pl.Object):
+            cats.append(name)
+        else:
+            nums.append(name)
+    return features, cats, nums
+
+
+def iter_ctr_partition_batches(
+    processed_dir: str | Path,
+    split: str,
+    feature_names: Sequence[str],
+    *,
+    target_col: str = "clk",
+    use_fe: bool = True,
+    batch_size: int = 65_536,
+) -> Iterator[tuple[pl.DataFrame, np.ndarray]]:
+    """Yield projected parquet data in bounded-memory batches.
+
+    This is intentionally separate from ``load_ctr_partition``: the latter keeps its historical
+    eager API, while streaming model/evaluation paths never materialise the full partition.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    path = ctr_partition_path(processed_dir, split, use_fe=use_fe)
+    requested = list(dict.fromkeys([target_col, *feature_names]))
+    schema = pl.read_parquet_schema(path)
+    missing = [name for name in requested if name not in schema]
+    if missing:
+        raise ValueError(f"{split} partition is missing required column(s): {missing}")
+    parquet = pq.ParquetFile(path)
+    for record_batch in parquet.iter_batches(batch_size=batch_size, columns=requested):
+        frame = pl.from_arrow(record_batch)
+        labels = frame.get_column(target_col).to_numpy()
+        yield frame.select(list(feature_names)), np.asarray(labels).ravel()
