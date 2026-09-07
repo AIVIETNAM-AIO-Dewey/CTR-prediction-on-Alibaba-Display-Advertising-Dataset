@@ -175,10 +175,16 @@ def evaluate_artifact(
     random_seed: int = 42,
     manifest_path: Optional[str | Path] = None,
     batch_size: Optional[int] = None,
+    model: Any = None,
 ) -> ModelEvaluationResult:
-    """Load one persisted wrapper and evaluate it on validation and test partitions."""
+    """Evaluate one persisted wrapper on validation and test partitions.
+
+    ``model`` may be supplied by an isolated worker that already fitted or loaded the
+    artifact.  This avoids deserializing a second copy of a potentially large model.
+    """
     cfg = load_config(str(config)) if isinstance(config, (str, Path)) else dict(config)
-    model = get_model_class(model_key).load(artifact_path)
+    if model is None:
+        model = get_model_class(model_key).load(artifact_path)
     features = list(model.feature_names)
     target = cfg.get("features", {}).get("target", "clk")
     use_fe = cfg.get("data", {}).get("use_fe", True)

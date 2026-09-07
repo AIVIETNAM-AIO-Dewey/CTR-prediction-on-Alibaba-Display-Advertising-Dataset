@@ -201,9 +201,17 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             model.save(artifact)
             config = {"model": "logistic_regression", "data": {"use_fe": True}, "features": {"target": "clk"}}
             eager = evaluate_artifact("logistic_regression", config, artifact, root, thresholds=[0.1, 0.5])
-            streamed = evaluate_artifact(
-                "logistic_regression", config, artifact, root, thresholds=[0.1, 0.5], batch_size=2
-            )
+            with patch("src.evaluate.evaluator.get_model_class") as loader:
+                streamed = evaluate_artifact(
+                    "logistic_regression",
+                    config,
+                    artifact,
+                    root,
+                    thresholds=[0.1, 0.5],
+                    batch_size=2,
+                    model=model,
+                )
+                loader.assert_not_called()
             self.assertEqual(streamed.validation.n_rows, eager.validation.n_rows)
             self.assertEqual(streamed.test.n_rows, eager.test.n_rows)
             self.assertAlmostEqual(

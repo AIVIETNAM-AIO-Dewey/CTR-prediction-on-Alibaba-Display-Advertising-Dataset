@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 # Set these before importing sklearn/native model libraries.
 for _name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ.setdefault(_name, "1")
+    os.environ[_name] = "1"
 
 from src.evaluate.evaluator import evaluate_artifact
 from src.evaluate.experiment_runner import write_json_atomic
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 def _thread_limited_environment() -> None:
     """Prevent native BLAS/OpenMP pools from multiplying a model's peak memory."""
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-        os.environ.setdefault(name, "1")
+        os.environ[name] = "1"
 
 
 def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
@@ -98,6 +98,7 @@ def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
         random_seed=int(job.get("random_seed", 42)),
         manifest_path=manifest_path,
         batch_size=int(job.get("eval_batch_size", 65_536)),
+        model=model,
     )
     result.metadata.update(
         {

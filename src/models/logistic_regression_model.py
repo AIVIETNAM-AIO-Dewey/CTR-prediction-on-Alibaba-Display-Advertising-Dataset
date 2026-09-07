@@ -168,10 +168,10 @@ class LogisticRegressionModel:
                         self.numeric_medians_[index] = float(value)
             connection.close()
         except Exception as exc:
-            # The project requires DuckDB in Kaggle, but retain a bounded fallback for minimal
-            # local installs. The method is persisted so signatures can distinguish the result.
-            self.stream_imputation_method_ = "mean_fallback"
-            logger.warning("DuckDB median pass unavailable; using bounded mean fallback: %s", exc)
+            # Exact median imputation is part of this model's preprocessing contract. A bounded
+            # mean fallback would silently change the experiment identity and its predictions.
+            self.stream_imputation_method_ = "median_unavailable"
+            raise RuntimeError("DuckDB exact median pass is required for streaming logistic regression.") from exc
 
         # Recompute scaler moments after replacing missing values with the fitted medians.
         scaled_sums = np.zeros(len(nums), dtype=np.float64)
