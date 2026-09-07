@@ -187,6 +187,31 @@ class FeatureEngineeringAndArtifactTests(unittest.TestCase):
             self.assertEqual(result.validation.n_rows, 4)
             self.assertEqual(result.test.n_rows, 4)
 
+    def test_artifact_evaluation_streams_batches_and_matches_row_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = pd.DataFrame({"price": [1, 2, 3, 4, 5, 6], "clk": [0, 0, 0, 1, 1, 1]})
+            val = pd.DataFrame({"price": [1.5, 2.5, 4.5, 5.5], "clk": [0, 1, 0, 1]})
+            test = pd.DataFrame({"price": [1.2, 3.2, 4.2, 6.2], "clk": [0, 0, 1, 1]})
+            for name, frame in (("train", train), ("val", val), ("test", test)):
+                pl.from_pandas(frame).write_parquet(root / f"{name}_fe.parquet")
+            model = LogisticRegressionModel(numeric_features=["price"], max_iter=100, n_jobs=1)
+            model.fit(train[["price"]], train["clk"])
+            artifact = root / "logistic_regression_fe.joblib"
+            model.save(artifact)
+            config = {"model": "logistic_regression", "data": {"use_fe": True}, "features": {"target": "clk"}}
+            eager = evaluate_artifact("logistic_regression", config, artifact, root, thresholds=[0.1, 0.5])
+            streamed = evaluate_artifact(
+                "logistic_regression", config, artifact, root, thresholds=[0.1, 0.5], batch_size=2
+            )
+            self.assertEqual(streamed.validation.n_rows, eager.validation.n_rows)
+            self.assertEqual(streamed.test.n_rows, eager.test.n_rows)
+            self.assertAlmostEqual(
+                streamed.validation.probability_metrics["log_loss"],
+                eager.validation.probability_metrics["log_loss"],
+                places=12,
+            )
+
     def test_dataset_loader_can_omit_validation_and_test(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

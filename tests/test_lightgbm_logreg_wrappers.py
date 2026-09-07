@@ -16,7 +16,11 @@ from src.models import (
     LogisticRegressionCTRModel,
     LogisticRegressionModel,
 )
-from src.models.data_utils import load_ctr_dataset
+from src.models.data_utils import (
+    ctr_partition_rows,
+    iter_ctr_partition_batches,
+    load_ctr_dataset,
+)
 from src.models.train import MODEL_REGISTRY, fit_from_config
 
 
@@ -230,6 +234,40 @@ class DatasetAndRunnerTests(unittest.TestCase):
                     sample_size=2,
                     sample_fraction=0.5,
                 )
+
+    def test_streaming_logistic_uses_all_rows_without_dataset_materialisation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            self._write_partitions(directory)
+            batches = list(
+                iter_ctr_partition_batches(
+                    directory, "train", ["price", "pid"], target_col="clk", batch_size=2
+                )
+            )
+            self.assertEqual(sum(len(labels) for _frame, labels in batches), 8)
+            self.assertEqual(ctr_partition_rows(directory, "train"), 8)
+
+            config = {
+                "model": "logistic_regression",
+                "paths": {"processed_dir": str(directory), "models_dir": str(directory / "models")},
+                "data": {"use_fe": True, "sample_size": 0, "sample_fraction": None, "random_seed": 42},
+                "features": {
+                    "target": "clk", "exclude_cols": ["clk", "nonclk"],
+                    "categorical": ["pid"], "numeric": ["price"], "drop_features": [],
+                },
+                "params": {
+                    "use_sgd": True, "solver": "sgd", "streaming": True,
+                    "stream_batch_size": 2, "stream_epochs": 1, "alpha": 1e-4,
+                    "n_jobs": 1,
+                },
+            }
+            result = fit_from_config(
+                config=config, save_artifact=False, write_manifest=False, sample_size=0
+            )
+            self.assertIsNone(result.dataset)
+            self.assertEqual(result.manifest["train_rows"], 8)
+            self.assertEqual(result.manifest["fit_mode"], "streaming_sgd")
+            self.assertTrue(np.isfinite(result.model.predict_proba(batches[0][0])).all())
 
 
 if __name__ == "__main__":

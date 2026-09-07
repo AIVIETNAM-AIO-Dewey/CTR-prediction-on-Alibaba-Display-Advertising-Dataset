@@ -28,7 +28,12 @@ if str(ROOT_DIR) not in sys.path:
 
 import yaml
 
-from src.models.data_utils import CTRDataset, load_ctr_dataset
+from src.models.data_utils import (
+    CTRDataset,
+    ctr_partition_rows,
+    inspect_ctr_features,
+    load_ctr_dataset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +82,7 @@ class FitResult:
 
     model_key: str
     model: Any
-    dataset: CTRDataset
+    dataset: Optional[CTRDataset]
     artifact_path: Path
     manifest: Dict[str, Any] = field(default_factory=dict)
     manifest_path: Optional[Path] = None
@@ -263,12 +268,41 @@ def fit_from_config(
 
     use_fe = data_cfg.get("use_fe", True) if use_fe is None else use_fe
     seed = data_cfg.get("random_seed", 42) if random_seed is None else random_seed
+    effective_requested_sample = data_cfg.get("sample_size") if sample_size is None else sample_size
+    effective_requested_fraction = data_cfg.get("sample_fraction") if sample_fraction is None else sample_fraction
+    if model_key == "random_forest" and (effective_requested_sample is None or effective_requested_sample <= 0) and effective_requested_fraction is None:
+        # sklearn forests are not incremental; avoid multiplying their dense matrix through
+        # joblib workers in the full-data path. This changes parallelism only, never row scope.
+        params["n_jobs"] = 1
+        logger.info("Random Forest full-data guard: forcing n_jobs=1; no sampling fallback is allowed.")
 
     logger.info("=" * 70)
     logger.info(f"FIT: {model_cls.__name__}  (config: {config_path or 'in-memory'})")
     logger.info("=" * 70)
 
-    if dataset is None:
+    streaming_lr = model_key == "logistic_regression" and bool(params.get("streaming", False))
+    stream_features: List[str] = []
+    stream_cats: List[str] = []
+    stream_nums: List[str] = []
+    if streaming_lr:
+        configured_sample = data_cfg.get("sample_size") if sample_size is None else sample_size
+        configured_fraction = data_cfg.get("sample_fraction") if sample_fraction is None else sample_fraction
+        if (configured_sample is not None and configured_sample > 0) or configured_fraction is not None:
+            raise ValueError("Streaming logistic regression requires full data; sampling is disabled.")
+        feature_cfg = config.get("features", {})
+        stream_excluded = list(feature_cfg.get("exclude_cols") or []) + list(
+            feature_cfg.get("drop_features") or []
+        )
+        stream_features, stream_cats, stream_nums = inspect_ctr_features(
+            processed_dir or paths_cfg.get("processed_dir", "data/processed"),
+            target_col=feature_cfg.get("target", "clk"),
+            exclude_cols=stream_excluded,
+            categorical_cols=feature_cfg.get("categorical"),
+            numeric_cols=feature_cfg.get("numeric"),
+            use_fe=use_fe,
+        )
+        dataset = None
+    elif dataset is None:
         dataset = load_dataset_from_config(
             config,
             processed_dir=processed_dir,
@@ -290,9 +324,9 @@ def fit_from_config(
     constructor_params = inspect.signature(model_cls.__init__).parameters
     model_kwargs = _build_kwargs(model_cls, params, seed)
     if "categorical_features" in constructor_params:
-        model_kwargs["categorical_features"] = dataset.categorical_features
+        model_kwargs["categorical_features"] = stream_cats if streaming_lr else dataset.categorical_features
     if "numeric_features" in constructor_params:
-        model_kwargs["numeric_features"] = dataset.numeric_features
+        model_kwargs["numeric_features"] = stream_nums if streaming_lr else dataset.numeric_features
     if "config" in constructor_params:
         model_kwargs["config"] = config
     model = model_cls(**model_kwargs)
@@ -307,17 +341,29 @@ def fit_from_config(
         fit_kwargs["verbose_eval"] = verbose_eval
 
     start = time.time()
-    model.fit(
-        X_train=dataset.X_train,
-        y_train=dataset.y_train,
-        X_val=dataset.X_val,
-        y_val=dataset.y_val,
-        **fit_kwargs,
-    )
+    if streaming_lr:
+        model.fit_streaming(
+            processed_dir or paths_cfg.get("processed_dir", "data/processed"),
+            target_col=config.get("features", {}).get("target", "clk"),
+            use_fe=use_fe,
+            batch_size=params.get("stream_batch_size"),
+            epochs=params.get("stream_epochs"),
+        )
+    else:
+        model.fit(
+            X_train=dataset.X_train,
+            y_train=dataset.y_train,
+            X_val=dataset.X_val,
+            y_val=dataset.y_val,
+            **fit_kwargs,
+        )
     elapsed = time.time() - start
     logger.info(f"Training finished in {elapsed:.1f}s.")
 
-    if sample_fraction is not None:
+    if streaming_lr:
+        effective_sample_size = None
+        effective_sample_fraction = None
+    elif sample_fraction is not None:
         effective_sample_size = None
         effective_sample_fraction = sample_fraction
     elif sample_size is not None:
@@ -336,7 +382,9 @@ def fit_from_config(
     )
     if save_artifact:
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        model.save(artifact_path)
+        temporary_artifact = artifact_path.with_name(f".{artifact_path.name}.tmp")
+        model.save(temporary_artifact)
+        temporary_artifact.replace(artifact_path)
 
     manifest = {
         "model": model_key,
@@ -348,13 +396,24 @@ def fit_from_config(
         # Keep the old key in manifests written by callers that still inspect
         # it, while the new checkpoint validator requires training_signature.
         "run_signature": training_signature,
-        "train_rows": int(len(dataset.X_train)),
-        "val_rows": int(len(dataset.X_val)) if dataset.X_val is not None else 0,
-        "test_rows": int(len(dataset.X_test)) if dataset.X_test is not None else 0,
-        "n_features": len(dataset.feature_names),
-        "feature_names": list(dataset.feature_names),
-        "categorical_features": list(dataset.categorical_features),
-        "numeric_features": list(dataset.numeric_features),
+        "train_rows": (
+            ctr_partition_rows(processed_dir or paths_cfg.get("processed_dir", "data/processed"), "train", use_fe=use_fe)
+            if streaming_lr else int(len(dataset.X_train))
+        ),
+        "val_rows": (
+            ctr_partition_rows(processed_dir or paths_cfg.get("processed_dir", "data/processed"), "val", use_fe=use_fe)
+            if streaming_lr and splits and "val" in splits
+            else (int(len(dataset.X_val)) if dataset is not None and dataset.X_val is not None else 0)
+        ),
+        "test_rows": int(len(dataset.X_test)) if dataset is not None and dataset.X_test is not None else 0,
+        "n_features": len(stream_features) if streaming_lr else len(dataset.feature_names),
+        "feature_names": list(stream_features) if streaming_lr else list(dataset.feature_names),
+        "categorical_features": list(stream_cats) if streaming_lr else list(dataset.categorical_features),
+        "numeric_features": list(stream_nums) if streaming_lr else list(dataset.numeric_features),
+        "fit_mode": "streaming_sgd" if streaming_lr else "in_memory",
+        "stream_batch_size": params.get("stream_batch_size") if streaming_lr else None,
+        "stream_epochs": params.get("stream_epochs") if streaming_lr else None,
+        "stream_imputation_method": getattr(model, "stream_imputation_method_", None),
         "dropped_features": list(config.get("features", {}).get("drop_features") or []),
         "early_stopping_rounds": fit_kwargs.get("early_stopping_rounds"),
         "best_iteration": int(getattr(model, "best_iteration_", 0) or 0),
@@ -379,8 +438,10 @@ def fit_from_config(
         )
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with open(manifest_path, "w", encoding="utf-8") as f:
+            temporary_manifest = manifest_path.with_name(f".{manifest_path.name}.tmp")
+            with temporary_manifest.open("w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2)
+            temporary_manifest.replace(manifest_path)
             logger.info(f"Saved training manifest to: {manifest_path}")
         except Exception as exc:
             logger.warning(f"Could not save manifest to {manifest_path}: {exc}")

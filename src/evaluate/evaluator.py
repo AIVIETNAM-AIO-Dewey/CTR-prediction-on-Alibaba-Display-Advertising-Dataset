@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -12,7 +13,11 @@ import numpy as np
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import precision_recall_curve, roc_curve
 
-from src.models.data_utils import load_ctr_partition
+from src.models.data_utils import (
+    ctr_partition_rows,
+    iter_ctr_partition_batches,
+    load_ctr_partition,
+)
 from src.models.train import get_model_class, load_config
 from src.evaluate.metrics import (
     compute_probability_metrics,
@@ -169,6 +174,7 @@ def evaluate_artifact(
     sample_fraction: Optional[float] = None,
     random_seed: int = 42,
     manifest_path: Optional[str | Path] = None,
+    batch_size: Optional[int] = None,
 ) -> ModelEvaluationResult:
     """Load one persisted wrapper and evaluate it on validation and test partitions."""
     cfg = load_config(str(config)) if isinstance(config, (str, Path)) else dict(config)
@@ -176,6 +182,55 @@ def evaluate_artifact(
     features = list(model.feature_names)
     target = cfg.get("features", {}).get("target", "clk")
     use_fe = cfg.get("data", {}).get("use_fe", True)
+
+    if batch_size is not None and batch_size <= 0:
+        raise ValueError("batch_size must be positive when provided.")
+    if batch_size is not None and (sample_fraction is not None or (sample_size or 0) > 0):
+        raise ValueError("Streaming evaluation does not support sampling; use all rows.")
+
+    if batch_size is not None:
+        with tempfile.TemporaryDirectory(prefix=f"eval_{model_key}_") as temporary:
+            def stream_predictions(split: str) -> tuple[np.memmap, np.memmap]:
+                rows = ctr_partition_rows(processed_dir, split, use_fe=use_fe)
+                model_features = list(features)
+                labels_path = Path(temporary) / f"{split}_labels.dat"
+                probabilities_path = Path(temporary) / f"{split}_probabilities.dat"
+                labels = np.memmap(labels_path, mode="w+", dtype=np.int8, shape=(rows,))
+                probabilities = np.memmap(
+                    probabilities_path, mode="w+", dtype=np.float64, shape=(rows,)
+                )
+                offset = 0
+                for batch_features, batch_labels in iter_ctr_partition_batches(
+                    processed_dir, split, model_features, target_col=target, use_fe=use_fe,
+                    batch_size=batch_size,
+                ):
+                    batch_probabilities = model.predict_proba(batch_features)
+                    end = offset + len(batch_labels)
+                    labels[offset:end] = np.asarray(batch_labels, dtype=np.int8)
+                    probabilities[offset:end] = np.asarray(batch_probabilities, dtype=np.float64)
+                    offset = end
+                    del batch_features, batch_labels, batch_probabilities
+                if offset != rows:
+                    raise RuntimeError(f"{split} streamed {offset} rows; expected {rows}.")
+                labels.flush()
+                probabilities.flush()
+                return labels, probabilities
+
+            y_val, p_val = stream_predictions("val")
+            y_test, p_test = stream_predictions("test")
+            result = evaluate_predictions(
+                model_key=model_key, y_val=y_val, p_val=p_val, y_test=y_test, p_test=p_test,
+                thresholds=thresholds, artifact_path=str(artifact_path),
+                manifest_path=str(manifest_path) if manifest_path else None,
+                metadata={
+                    "feature_count": len(features), "use_fe": bool(use_fe),
+                    "eval_sample_size": 0, "eval_sample_fraction": None,
+                    "random_seed": random_seed, "eval_mode": "streaming",
+                    "eval_batch_size": batch_size,
+                },
+            )
+            del y_val, p_val, y_test, p_test
+            return result
 
     X_val, y_val = load_ctr_partition(
         str(processed_dir),
@@ -218,6 +273,7 @@ def evaluate_artifact(
             "eval_sample_size": sample_size,
             "eval_sample_fraction": sample_fraction,
             "random_seed": random_seed,
+            "eval_mode": "in_memory",
         },
     )
 

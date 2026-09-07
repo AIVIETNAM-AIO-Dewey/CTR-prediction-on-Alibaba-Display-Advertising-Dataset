@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -15,6 +16,13 @@ import scipy.sparse as sp
 import yaml
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from src.models.data_utils import (
+    ctr_partition_path,
+    ctr_partition_rows,
+    inspect_ctr_features,
+    iter_ctr_partition_batches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +44,9 @@ class LogisticRegressionModel:
         class_weight: Any = None,
         random_state: int = 42,
         n_jobs: int = -1,
+        streaming: bool = False,
+        stream_batch_size: int = 65_536,
+        stream_epochs: int = 1,
         categorical_features: Optional[List[str]] = None,
         numeric_features: Optional[List[str]] = None,
         config: Optional[Dict[str, Any]] = None,
@@ -51,6 +62,9 @@ class LogisticRegressionModel:
         self.class_weight = class_weight
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.streaming = bool(streaming)
+        self.stream_batch_size = int(stream_batch_size)
+        self.stream_epochs = int(stream_epochs)
         self.categorical_features = list(categorical_features or [])
         self.numeric_features = list(numeric_features or [])
         self.config = config or {}
@@ -64,8 +78,207 @@ class LogisticRegressionModel:
         self.ohe_: Optional[OneHotEncoder] = None
         self.estimator: Optional[Union[LogisticRegression, SGDClassifier]] = None
         self.transformed_feature_names_: List[str] = []
+        self.stream_imputation_method_ = None
         self.best_iteration_ = 0
         self.is_fitted = False
+
+    def _fit_streaming_preprocessor(
+        self,
+        processed_dir: Union[str, Path],
+        *,
+        target_col: str,
+        use_fe: bool,
+        batch_size: int,
+    ) -> tuple[List[str], int]:
+        """Fit bounded-memory category/statistics state over the train parquet."""
+        feature_config = self.config.get("features", {})
+        excluded = list(feature_config.get("exclude_cols") or []) + list(
+            feature_config.get("drop_features") or []
+        )
+        feature_names, cats, nums = inspect_ctr_features(
+            processed_dir,
+            target_col=target_col,
+            exclude_cols=excluded,
+            categorical_cols=self.categorical_features,
+            numeric_cols=self.numeric_features,
+            use_fe=use_fe,
+        )
+        self.feature_names = list(feature_names)
+        self.active_categorical_features_ = list(cats)
+        self.active_numeric_features_ = list(nums)
+        if set(self.active_categorical_features_) | set(self.active_numeric_features_) != set(self.feature_names):
+            raise RuntimeError("Streaming feature metadata does not cover the projected train schema.")
+        if not self.feature_names:
+            raise ValueError("Streaming training requires at least one feature.")
+
+        category_values = {column: set() for column in cats}
+        sums = np.zeros(len(nums), dtype=np.float64)
+        squares = np.zeros(len(nums), dtype=np.float64)
+        counts = np.zeros(len(nums), dtype=np.int64)
+        rows_seen = 0
+        for frame, _labels in iter_ctr_partition_batches(
+            processed_dir, "train", feature_names, target_col=target_col,
+            use_fe=use_fe, batch_size=batch_size,
+        ):
+            rows_seen += len(frame)
+            for index, column in enumerate(cats):
+                values = (
+                    frame.get_column(column)
+                    .cast(pl.String, strict=False)
+                    .fill_null("__MISSING__")
+                    .to_list()
+                )
+                category_values[column].update(str(value) for value in values)
+            if nums:
+                values = np.asarray(
+                    frame.select(
+                        [pl.col(column).cast(pl.Float64, strict=False) for column in nums]
+                    ).to_numpy(),
+                    dtype=np.float64,
+                )
+                finite = np.isfinite(values)
+                safe = np.where(finite, values, 0.0)
+                sums += safe.sum(axis=0)
+                squares += np.square(safe).sum(axis=0)
+                counts += finite.sum(axis=0).astype(np.int64)
+
+        if rows_seen <= 0:
+            raise ValueError("Streaming training partition is empty.")
+        # Keep the historical median imputation semantics without materialising a numeric
+        # column in Python. DuckDB scans one column at a time and can spill to its temp directory.
+        self.stream_imputation_method_ = "median"
+        self.numeric_medians_ = np.divide(
+            sums, np.maximum(counts, 1), out=np.zeros_like(sums), where=counts > 0
+        )
+        try:
+            import duckdb
+
+            train_path = ctr_partition_path(processed_dir, "train", use_fe=use_fe)
+            connection = duckdb.connect()
+            connection.execute("SET memory_limit='512MB'")
+            with tempfile.TemporaryDirectory(prefix="ctr_stream_duckdb_") as spill_dir:
+                connection.execute(f"SET temp_directory='{spill_dir.replace(chr(39), chr(39) + chr(39))}'")
+                for index, column in enumerate(nums):
+                    quoted = '"' + column.replace('"', '""') + '"'
+                    value = connection.execute(
+                        f"SELECT median(try_cast({quoted} AS DOUBLE)) FROM read_parquet(?)",
+                        [str(train_path)],
+                    ).fetchone()[0]
+                    if value is not None and np.isfinite(float(value)):
+                        self.numeric_medians_[index] = float(value)
+            connection.close()
+        except Exception as exc:
+            # The project requires DuckDB in Kaggle, but retain a bounded fallback for minimal
+            # local installs. The method is persisted so signatures can distinguish the result.
+            self.stream_imputation_method_ = "mean_fallback"
+            logger.warning("DuckDB median pass unavailable; using bounded mean fallback: %s", exc)
+
+        # Recompute scaler moments after replacing missing values with the fitted medians.
+        scaled_sums = np.zeros(len(nums), dtype=np.float64)
+        scaled_squares = np.zeros(len(nums), dtype=np.float64)
+        scaled_counts = np.zeros(len(nums), dtype=np.int64)
+        if nums:
+            for frame, _labels in iter_ctr_partition_batches(
+                processed_dir, "train", feature_names, target_col=target_col,
+                use_fe=use_fe, batch_size=batch_size,
+            ):
+                values = np.asarray(
+                    frame.select(
+                        [pl.col(column).cast(pl.Float64, strict=False) for column in nums]
+                    ).to_numpy(),
+                    dtype=np.float64,
+                )
+                values[~np.isfinite(values)] = np.take(self.numeric_medians_, np.where(~np.isfinite(values))[1])
+                scaled_sums += values.sum(axis=0)
+                scaled_squares += np.square(values).sum(axis=0)
+                scaled_counts += len(values)
+            means = np.divide(
+                scaled_sums, np.maximum(scaled_counts, 1), out=np.zeros_like(scaled_sums), where=scaled_counts > 0
+            )
+            variances = np.maximum(
+                np.divide(scaled_squares, np.maximum(scaled_counts, 1), out=np.zeros_like(scaled_squares), where=scaled_counts > 0)
+                - np.square(means), 0.0
+            )
+        else:
+            means = np.asarray([], dtype=np.float64)
+            variances = np.asarray([], dtype=np.float64)
+        if nums:
+            self.scaler_ = StandardScaler(with_mean=False)
+            self.scaler_.mean_ = means
+            self.scaler_.var_ = variances
+            self.scaler_.scale_ = np.where(variances > 0, np.sqrt(variances), 1.0)
+            self.scaler_.n_features_in_ = len(nums)
+            self.scaler_.n_samples_seen_ = max(rows_seen, 1)
+        if cats:
+            categories = [np.asarray(sorted(category_values[column]), dtype=object) for column in cats]
+            if any(len(values) == 0 for values in categories):
+                raise ValueError("A categorical streaming feature has no observed values.")
+            self.ohe_ = OneHotEncoder(
+                categories=categories, handle_unknown="ignore", sparse_output=True, dtype=np.float32
+            )
+            self.ohe_.fit(np.asarray([[values[0] for values in categories]], dtype=object))
+        names = list(nums)
+        if self.ohe_ is not None:
+            names.extend(self.ohe_.get_feature_names_out(cats).tolist())
+        self.transformed_feature_names_ = names
+        return feature_names, rows_seen
+
+    def fit_streaming(
+        self,
+        processed_dir: Union[str, Path],
+        *,
+        target_col: str = "clk",
+        use_fe: bool = True,
+        batch_size: Optional[int] = None,
+        epochs: Optional[int] = None,
+    ) -> "LogisticRegressionModel":
+        """Train SGD logistic regression over all rows without materialising train data."""
+        batch_size = self.stream_batch_size if batch_size is None else int(batch_size)
+        epochs = self.stream_epochs if epochs is None else int(epochs)
+        if batch_size <= 0 or epochs <= 0:
+            raise ValueError("Streaming batch_size and epochs must be positive.")
+        feature_names, expected_rows = self._fit_streaming_preprocessor(
+            processed_dir, target_col=target_col, use_fe=use_fe, batch_size=batch_size
+        )
+        expected_rows = ctr_partition_rows(processed_dir, "train", use_fe=use_fe)
+        params: Dict[str, Any] = {
+            "loss": "log_loss",
+            "penalty": self.penalty,
+            "alpha": self.alpha,
+            "max_iter": 1,
+            "tol": None,
+            "class_weight": self.class_weight,
+            "random_state": self.random_state,
+            "shuffle": False,
+            **self.extra_kwargs,
+        }
+        self.estimator = SGDClassifier(**params)
+        classes = np.asarray([0, 1], dtype=np.int8)
+        rows_seen = 0
+        for epoch in range(epochs):
+            epoch_rows = 0
+            for frame, labels in iter_ctr_partition_batches(
+                processed_dir, "train", feature_names, target_col=target_col,
+                use_fe=use_fe, batch_size=batch_size,
+            ):
+                matrix = self._transform_features(frame, fitting=False)
+                self.estimator.partial_fit(
+                    matrix, labels, classes=classes if epoch == 0 and epoch_rows == 0 else None
+                )
+                epoch_rows += len(labels)
+                rows_seen += len(labels)
+                del matrix, frame, labels
+            if epoch_rows != expected_rows:
+                raise RuntimeError(
+                    f"Streaming epoch consumed {epoch_rows} rows; expected {expected_rows}."
+                )
+        self.best_iteration_ = epochs
+        self.is_fitted = True
+        logger.info(
+            "[%s] streaming SGD complete: rows=%d epochs=%d batch_size=%d features=%d",
+            self.model_name, rows_seen, epochs, batch_size, len(self.transformed_feature_names_),
+        )
+        return self
 
     @staticmethod
     def _read_config(config_path_or_dict: Union[str, Path, Dict[str, Any]]) -> Dict[str, Any]:
